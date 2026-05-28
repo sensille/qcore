@@ -161,9 +161,11 @@ static void parse_net_table(fd_list_t *fds, const char *path,
 }
 
 /* Parse /proc/net/unix and match entries to our socket inodes. */
-static void parse_net_unix(fd_list_t *fds)
+static void parse_net_unix(fd_list_t *fds, pid_t pid)
 {
-    FILE *f = fopen("/proc/net/unix", "r");
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/net/unix", (int)pid);
+    FILE *f = fopen(path, "r");
     if (!f) return;
 
     char line[512];
@@ -247,12 +249,20 @@ int harvest_fds(qcore_state_t *state)
     }
     closedir(d);
 
-    /* Resolve socket inodes against the network tables */
-    parse_net_table(&state->fds, "/proc/net/tcp",  FD_TYPE_SOCKET_TCP4, FD_TYPE_SOCKET_TCP4);
-    parse_net_table(&state->fds, "/proc/net/tcp6", FD_TYPE_SOCKET_TCP6, FD_TYPE_SOCKET_TCP6);
-    parse_net_table(&state->fds, "/proc/net/udp",  FD_TYPE_SOCKET_UDP4, FD_TYPE_SOCKET_UDP4);
-    parse_net_table(&state->fds, "/proc/net/udp6", FD_TYPE_SOCKET_UDP6, FD_TYPE_SOCKET_UDP6);
-    parse_net_unix(&state->fds);
+    /* Read network tables from the target's own network namespace via
+     * /proc/<pid>/net/ so that containerised processes (which live in a
+     * separate netns) are handled correctly. */
+    pid_t pid = state->target_pid;
+    char tcp_path[64], tcp6_path[64], udp_path[64], udp6_path[64];
+    snprintf(tcp_path,  sizeof(tcp_path),  "/proc/%d/net/tcp",  (int)pid);
+    snprintf(tcp6_path, sizeof(tcp6_path), "/proc/%d/net/tcp6", (int)pid);
+    snprintf(udp_path,  sizeof(udp_path),  "/proc/%d/net/udp",  (int)pid);
+    snprintf(udp6_path, sizeof(udp6_path), "/proc/%d/net/udp6", (int)pid);
+    parse_net_table(&state->fds, tcp_path,  FD_TYPE_SOCKET_TCP4, FD_TYPE_SOCKET_TCP4);
+    parse_net_table(&state->fds, tcp6_path, FD_TYPE_SOCKET_TCP6, FD_TYPE_SOCKET_TCP6);
+    parse_net_table(&state->fds, udp_path,  FD_TYPE_SOCKET_UDP4, FD_TYPE_SOCKET_UDP4);
+    parse_net_table(&state->fds, udp6_path, FD_TYPE_SOCKET_UDP6, FD_TYPE_SOCKET_UDP6);
+    parse_net_unix(&state->fds, pid);
 
     printf("[phase2] harvested %d file descriptor(s)\n", state->fds.count);
     return 0;
