@@ -13,7 +13,7 @@ static volatile char heap_marker[64];
 
 int main(void)
 {
-    /* Marker must survive optimisation – write it at runtime. */
+    /* Marker must survive optimisation - write it at runtime. */
     memcpy((char *)heap_marker, "QCORE_MEMORY_MARKER_DEADBEEF1234", 33);
 
     printf("ready pid=%d\n", getpid());

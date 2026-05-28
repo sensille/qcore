@@ -98,6 +98,7 @@ typedef struct {
     int                     injector_idx;
     uint64_t                injector_saved_word;     /* 8 bytes at original RIP */
     struct user_regs_struct injector_saved_regs;
+    int                     injector_bytes_modified; /* 1 once we wrote syscall opcode */
 
     char core_path[256];
     char sockets_json_path[256];

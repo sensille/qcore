@@ -1,13 +1,13 @@
 /*
- * Phase 5 – Build a valid ELF64 core file from the COW child.
+ * Phase 5 - Build a valid ELF64 core file from the COW child.
  *
  * File layout
- * ───────────
+ * -----------
  *   [ Elf64_Ehdr                              ]  64 bytes
- *   [ Elf64_Phdr[0]  – PT_NOTE               ]  56 bytes
- *   [ Elf64_Phdr[1]  – PT_LOAD[0]            ]  56 bytes
+ *   [ Elf64_Phdr[0]  - PT_NOTE               ]  56 bytes
+ *   [ Elf64_Phdr[1]  - PT_LOAD[0]            ]  56 bytes
  *   [ ...                                     ]
- *   [ Elf64_Phdr[N]  – PT_LOAD[N-1]          ]  56 bytes
+ *   [ Elf64_Phdr[N]  - PT_LOAD[N-1]          ]  56 bytes
  *   < padding to align note data to 4 bytes  >
  *   [ NOTE data (NT_PRSTATUS * nthreads +      ]
  *     NT_PRPSINFO + NT_FILE)                  ]
@@ -261,7 +261,7 @@ static int dump_segment(int core_fd, int mem_fd,
 
         ssize_t r = pread(mem_fd, buf, chunk, (off_t)(vaddr + off));
         if (r <= 0) {
-            /* Unreadable region – zero fill */
+            /* Unreadable region - zero fill */
             memset(buf, 0, chunk);
             r = (ssize_t)chunk;
         }

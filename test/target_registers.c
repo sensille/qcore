@@ -25,7 +25,7 @@
 
 int main(void)
 {
-    /* Announce readiness before blocking – the test harness reads this. */
+    /* Announce readiness before blocking - the test harness reads this. */
     printf("ready pid=%d rbx=0x%llx r12=0x%llx r13=0x%llx\n",
            getpid(),
            (unsigned long long)SENTINEL_RBX,

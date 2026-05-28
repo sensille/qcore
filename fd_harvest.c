@@ -1,5 +1,5 @@
 /*
- * Phase 2 – FD and socket harvesting.
+ * Phase 2 - FD and socket harvesting.
  *
  * While the target is fully frozen we enumerate /proc/<pid>/fd/, classify
  * each descriptor, and cross-reference socket inodes against /proc/net/tcp,
@@ -10,7 +10,7 @@
 
 /* TCP state table (value is the kernel's internal state index, 1-based). */
 static const char *TCP_STATES[] = {
-    "UNKNOWN",       /* 0  – not used by kernel */
+    "UNKNOWN",       /* 0  - not used by kernel */
     "ESTABLISHED",   /* 01 */
     "SYN_SENT",      /* 02 */
     "SYN_RECV",      /* 03 */

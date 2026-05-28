@@ -13,7 +13,7 @@
 
 set -u
 
-# ── Locate binaries ────────────────────────────────────────────────────────
+# -- Locate binaries --------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 QCORE="$SCRIPT_DIR/../qcore"
 BIN_DIR="$SCRIPT_DIR"
@@ -21,7 +21,7 @@ BIN_DIR="$SCRIPT_DIR"
 VERBOSE=0
 [[ "${1:-}" == "-v" ]] && VERBOSE=1
 
-# ── Counters and colour ────────────────────────────────────────────────────
+# -- Counters and colour ----------------------------------------------------
 PASS=0; FAIL=0; SKIP=0
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -33,9 +33,9 @@ fail() {
     ((FAIL++)) || true
 }
 skip() { echo -e "${YELLOW}[SKIP]${NC} $1  (${2})"; ((SKIP++)) || true; }
-section() { echo -e "\n${BOLD}── $1 ──${NC}"; }
+section() { echo -e "\n${BOLD}-- $1 --${NC}"; }
 
-# ── Cleanup ────────────────────────────────────────────────────────────────
+# -- Cleanup ----------------------------------------------------------------
 CLEANUP_PIDS=()
 CLEANUP_FILES=()
 
@@ -50,7 +50,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+# -- Helpers ----------------------------------------------------------------
 
 # Start a target binary, capture its "ready ..." stdout line, return PID.
 # Usage: start_target <binary> [args...]
@@ -120,15 +120,15 @@ stop_target() {
     CLEANUP_PIDS=("${CLEANUP_PIDS[@]/$pid}")
 }
 
-# ── Pre-flight ─────────────────────────────────────────────────────────────
+# -- Pre-flight -------------------------------------------------------------
 preflight() {
     local ok=1
 
-    [[ -x "$QCORE" ]] || { echo "qcore binary not found at $QCORE – run 'make' first"; ok=0; }
+    [[ -x "$QCORE" ]] || { echo "qcore binary not found at $QCORE - run 'make' first"; ok=0; }
 
     for t in target_simple target_mt target_sockets target_registers; do
         [[ -x "$BIN_DIR/$t" ]] || {
-            echo "Missing test binary: $BIN_DIR/$t – run 'make' in test/ first"
+            echo "Missing test binary: $BIN_DIR/$t - run 'make' in test/ first"
             ok=0
         }
     done
@@ -139,14 +139,14 @@ preflight() {
 
     # Verify we have ptrace privileges (root or passwordless sudo)
     if [[ $EUID -ne 0 ]] && ! sudo -n true 2>/dev/null; then
-        echo "Need root or passwordless sudo – run as: sudo bash run_tests.sh"
+        echo "Need root or passwordless sudo - run as: sudo bash run_tests.sh"
         ok=0
     fi
 
     [[ $ok -eq 1 ]] || exit 1
 }
 
-# ── Error-handling tests (no target needed) ────────────────────────────────
+# -- Error-handling tests (no target needed) --------------------------------
 section "Error handling"
 
 t_no_args() {
@@ -178,7 +178,7 @@ t_bad_pid() {
     fi
 }
 
-# ── ELF structure tests ────────────────────────────────────────────────────
+# -- ELF structure tests ----------------------------------------------------
 section "ELF core structure (single-threaded target)"
 
 t_elf_valid() {
@@ -268,7 +268,7 @@ t_notes() {
     stop_target "$pid"
 }
 
-# ── Target liveness ────────────────────────────────────────────────────────
+# -- Target liveness --------------------------------------------------------
 section "Target liveness"
 
 t_target_alive() {
@@ -281,7 +281,7 @@ t_target_alive() {
         pass "alive: target still running after dump"
     else
         fail "alive: target still running after dump" \
-             "process $pid is dead – Phase 4 (restore/detach) likely broken"
+             "process $pid is dead - Phase 4 (restore/detach) likely broken"
     fi
 
     stop_target "$pid"
@@ -304,7 +304,7 @@ t_core_size() {
     stop_target "$pid"
 }
 
-# ── Memory content ─────────────────────────────────────────────────────────
+# -- Memory content ---------------------------------------------------------
 section "Memory content"
 
 t_marker_string() {
@@ -317,13 +317,13 @@ t_marker_string() {
         pass "marker: known BSS string found in core memory"
     else
         fail "marker: known BSS string found in core memory" \
-             "strings/grep found nothing – PT_LOAD data may be missing"
+             "strings/grep found nothing - PT_LOAD data may be missing"
     fi
 
     stop_target "$pid"
 }
 
-# ── Multi-threaded ─────────────────────────────────────────────────────────
+# -- Multi-threaded ---------------------------------------------------------
 section "Multi-threaded target (8 threads)"
 
 t_multithreaded() {
@@ -335,14 +335,14 @@ t_multithreaded() {
 
     run_qcore "$pid" || { fail "mt: qcore failed"; stop_target "$pid"; return; }
 
-    # Count NT_PRSTATUS occurrences – one per thread
+    # Count NT_PRSTATUS occurrences - one per thread
     local n_prstatus
     n_prstatus=$(readelf -n "core.$pid" 2>/dev/null | grep -c "NT_PRSTATUS" || true)
     if [[ "$n_prstatus" -ge "$n_threads" ]]; then
-        pass "mt: $n_prstatus NT_PRSTATUS notes (≥ $n_threads threads)"
+        pass "mt: $n_prstatus NT_PRSTATUS notes (>= $n_threads threads)"
     else
         fail "mt: at least $n_threads NT_PRSTATUS notes" \
-             "got $n_prstatus – some threads may not have been seized"
+             "got $n_prstatus - some threads may not have been seized"
     fi
 
     if kill -0 "$pid" 2>/dev/null; then
@@ -354,7 +354,7 @@ t_multithreaded() {
     stop_target "$pid"
 }
 
-# ── Socket JSON ────────────────────────────────────────────────────────────
+# -- Socket JSON ------------------------------------------------------------
 section "Socket and FD harvesting"
 
 t_json_valid() {
@@ -464,7 +464,7 @@ print(len(d['fds']))
 " 2>/dev/null || echo 0)
 
     if [[ "$count" -ge 3 ]]; then
-        pass "json_fds: $count FDs captured (≥ stdin/stdout/stderr)"
+        pass "json_fds: $count FDs captured (>= stdin/stdout/stderr)"
     else
         fail "json_fds: at least 3 FDs (stdin/stdout/stderr)" "got $count"
     fi
@@ -472,7 +472,7 @@ print(len(d['fds']))
     stop_target "$pid"
 }
 
-# ── GDB tests (optional) ───────────────────────────────────────────────────
+# -- GDB tests (optional) ---------------------------------------------------
 section "GDB integration"
 
 HAS_GDB=0
@@ -547,7 +547,7 @@ t_gdb_backtrace() {
     if echo "$bt_out" | grep -qE 'in (main|pause|worker|_start|__libc)'; then
         pass "gdb_backtrace: named symbols in backtrace"
     elif [[ "$n_frames" -ge 3 ]]; then
-        pass "gdb_backtrace: $n_frames frames (PIE – symbols unresolved but stack intact)"
+        pass "gdb_backtrace: $n_frames frames (PIE - symbols unresolved but stack intact)"
     else
         fail "gdb_backtrace: at least 3 backtrace frames with symbols" \
              "$(echo "$bt_out" | grep '^#' | head -5)"
@@ -582,17 +582,17 @@ t_gdb_threads() {
     local gdb_thread_count
     gdb_thread_count=$(echo "$gdb_out" | grep -cE '^\s*\*?\s*[0-9]+\s+(LWP|Thread)\s' || true)
     if [[ "$gdb_thread_count" -ge "$n_threads" ]]; then
-        pass "gdb_threads: GDB sees $gdb_thread_count threads (≥ $n_threads)"
+        pass "gdb_threads: GDB sees $gdb_thread_count threads (>= $n_threads)"
     else
         fail "gdb_threads: GDB sees all $n_threads threads" \
-             "GDB reported $gdb_thread_count – raw output:" \
+             "GDB reported $gdb_thread_count - raw output:" \
              "$(echo "$gdb_out" | grep -E 'Thread|LWP|Id ' | head -10)"
     fi
 
     stop_target "$pid"
 }
 
-# ── Register fidelity ──────────────────────────────────────────────────────
+# -- Register fidelity ------------------------------------------------------
 section "Register fidelity"
 
 t_register_sentinels() {
@@ -642,7 +642,7 @@ t_register_sentinels() {
     stop_target "$pid"
 }
 
-# ── Sockets output file created ────────────────────────────────────────────
+# -- Sockets output file created --------------------------------------------
 t_sockets_file_created() {
     start_target "$BIN_DIR/target_simple" || { fail "sockets_file: target startup"; return; }
     local pid="$TARGET_PID"
@@ -658,7 +658,7 @@ t_sockets_file_created() {
     stop_target "$pid"
 }
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# -- Main -------------------------------------------------------------------
 main() {
     echo -e "${BOLD}qcore test suite${NC}"
     echo "qcore:    $QCORE"
@@ -706,7 +706,7 @@ main() {
     section "Register fidelity"
     t_register_sentinels
 
-    # ── Summary ────────────────────────────────────────────────────────────
+    # -- Summary ------------------------------------------------------------
     echo ""
     echo -e "${BOLD}Results: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}, ${YELLOW}$SKIP skipped${NC}"
 

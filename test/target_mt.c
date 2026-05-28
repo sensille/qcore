@@ -9,7 +9,7 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#define N_WORKERS 7   /* +1 for main → 8 total threads */
+#define N_WORKERS 7   /* +1 for main -> 8 total threads */
 
 static void *worker(void *arg)
 {

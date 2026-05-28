@@ -1,10 +1,15 @@
 /*
- * Phase 1 – Race-condition-safe thread seizing.
+ * Phase 1 - Race-condition-safe thread seizing.
  *
- * We iterate /proc/<pid>/task in a loop, attaching any TID we haven't seen
- * yet.  We only stop iterating when a full directory scan produces zero new
- * attachments.  After the loop every thread is in ptrace-stop and we harvest
- * its GP registers for the PT_NOTE section.
+ * Uses PTRACE_SEIZE + PTRACE_INTERRUPT instead of PTRACE_ATTACH.
+ * PTRACE_ATTACH sends SIGSTOP to every thread; even though ptrace consumes
+ * the signal on detach, the signal delivery machinery can disturb futex wait
+ * queues, signal masks, and pending-signal state in ways that accumulate
+ * across repeated invocations and eventually break the target.
+ *
+ * PTRACE_SEIZE attaches without sending any signal.  PTRACE_INTERRUPT stops
+ * each thread via a ptrace-internal PTRACE_EVENT_STOP that is invisible to
+ * the application's signal handling.
  */
 #include "qcore.h"
 
@@ -49,18 +54,24 @@ int seize_all_threads(qcore_state_t *state)
         while ((ent = readdir(d)) != NULL) {
             if (ent->d_name[0] == '.')
                 continue;
-            pid_t tid = (pid_t)atoi(ent->d_name);
+            pid_t tid = (pid_t)((int)strtol(ent->d_name, NULL, 10));
             if (tid <= 0)
                 continue;
             if (thread_in_set(&state->threads, tid))
                 continue;
 
-            if (ptrace(PTRACE_ATTACH, tid, NULL, NULL) == -1) {
-                if (errno == ESRCH) {
-                    /* Thread exited between readdir and attach – benign. */
+            if (ptrace(PTRACE_SEIZE, tid, 0, 0) == -1) {
+                if (errno == ESRCH)
                     continue;
-                }
-                fprintf(stderr, "PTRACE_ATTACH(%d): %s\n", (int)tid, strerror(errno));
+                fprintf(stderr, "PTRACE_SEIZE(%d): %s\n", (int)tid, strerror(errno));
+                closedir(d);
+                return -1;
+            }
+
+            if (ptrace(PTRACE_INTERRUPT, tid, 0, 0) == -1) {
+                if (errno == ESRCH)
+                    continue;
+                fprintf(stderr, "PTRACE_INTERRUPT(%d): %s\n", (int)tid, strerror(errno));
                 closedir(d);
                 return -1;
             }
@@ -74,7 +85,7 @@ int seize_all_threads(qcore_state_t *state)
         closedir(d);
 
         if (new_count == 0)
-            break;   /* Full scan found nothing new – all threads are seized. */
+            break;
     }
 
     if (state->threads.count == 0) {
@@ -82,25 +93,20 @@ int seize_all_threads(qcore_state_t *state)
         return -1;
     }
 
-    /*
-     * Wait for every attached thread to reach ptrace-stop and harvest
-     * registers.  Threads that exit between attach and waitpid are silently
-     * removed from the set.
-     */
     int valid = 0;
     for (int i = 0; i < state->threads.count; i++) {
         thread_info_t *t = &state->threads.data[i];
         int status = 0;
 
         if (waitpid(t->tid, &status, __WALL) == -1) {
-            fprintf(stderr, "waitpid(%d): %s – skipping\n",
+            fprintf(stderr, "waitpid(%d): %s - skipping\n",
                     (int)t->tid, strerror(errno));
-            t->tid = -1;   /* mark as invalid */
+            t->tid = -1;
             continue;
         }
 
         if (!WIFSTOPPED(status)) {
-            fprintf(stderr, "TID %d not stopped (status=0x%x) – skipping\n",
+            fprintf(stderr, "TID %d not stopped (status=0x%x) - skipping\n",
                     (int)t->tid, status);
             t->tid = -1;
             continue;
@@ -115,7 +121,6 @@ int seize_all_threads(qcore_state_t *state)
         valid++;
     }
 
-    /* Compact out any TIDs marked invalid. */
     int dst = 0;
     for (int i = 0; i < state->threads.count; i++) {
         if (state->threads.data[i].tid > 0)
