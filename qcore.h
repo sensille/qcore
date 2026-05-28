@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/procfs.h>
 #include <elf.h>
+#include <limits.h>
 
 #define PAGE_SIZE_DEFAULT 4096UL
 #define DA_INIT_CAP 64
@@ -92,13 +93,20 @@ typedef struct {
     pid_t        target_pid;
     thread_set_t threads;
     fd_list_t    fds;
-    pid_t        child_pid;
 
-    /* Injector thread bookkeeping (for Phase 3/4) */
-    int                     injector_idx;
-    uint64_t                injector_saved_word;     /* 8 bytes at original RIP */
-    struct user_regs_struct injector_saved_regs;
-    int                     injector_bytes_modified; /* 1 once we wrote syscall opcode */
+    /* Safe thread: the thread used for parasite injection.
+     * Preference: a thread that was in user-space (orig_rax == -1)
+     * so restoration is completely clean with no rip-2 restart. */
+    int                     safe_thread_idx;
+    uint64_t                safe_saved_word;     /* original 8 bytes at RIP */
+    struct user_regs_struct safe_saved_regs;     /* original registers      */
+    int                     safe_bytes_modified; /* 1 after PTRACE_POKETEXT */
+
+    /* Parasite allocation (3 pages: scratch + child1 stack + code). */
+    uint64_t mmap_addr;    /* base address; 0 until allocated              */
+
+    /* Child 2: the orphaned grandchild holding the COW snapshot. */
+    pid_t    child2_pid;
 
     char core_path[256];
     char sockets_json_path[256];
@@ -109,6 +117,5 @@ typedef struct {
 int  seize_all_threads(qcore_state_t *state);           /* seize.c      */
 int  harvest_fds(qcore_state_t *state);                 /* fd_harvest.c */
 void write_sockets_json(const qcore_state_t *state);    /* fd_harvest.c */
-int  cow_clone(qcore_state_t *state);                   /* cow_clone.c  */
-int  resume_parent(qcore_state_t *state);               /* resume.c     */
+int  inject_parasite(qcore_state_t *state);             /* inject.c     */
 int  dump_core(qcore_state_t *state);                   /* elf_dump.c   */

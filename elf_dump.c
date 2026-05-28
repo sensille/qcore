@@ -276,7 +276,7 @@ static int dump_segment(int core_fd, int mem_fd,
 
 int dump_core(qcore_state_t *state)
 {
-    pid_t cpid = state->child_pid;
+    pid_t cpid = state->child2_pid;
 
     /* --- Parse /proc/child/maps --- */
     map_list_t maps = {0};

@@ -1,0 +1,80 @@
+Build an advanced, high-performance, zero-pause core dumper for Linux (x86_64) named qcore.
+
+Standard core dumpers pause the target process for the duration of disk I/O, which is unacceptable for production systems. Previous attempts to use naive ptrace + syscall injection resulted in ERESTARTSYS corruption and application watchdogs crashing the parent due to visible child processes.
+
+qcore must bypass these issues by orchestrating a Parasite-injected Stealth Double-Fork combined with external ELF stitching.
+
+Please write this in C or Rust (optimize for raw syscall access, ptrace safety, and ELF manipulation).
+
+Here is the exact architectural flow, state machine, and separation of responsibilities you must implement:
+
+Phase 1: Robust Seize and the "Safe Thread" Hunt
+Target Identification: Accept a target PID.
+
+Iterative Attach Loop (Race-Condition Safe): * Read /proc/[pid]/task/.
+
+Try to ptrace(PTRACE_ATTACH) all discovered TIDs. Ignore ESRCH.
+
+Repeat the read/attach loop until a full directory scan yields no new unattached threads.
+
+State Harvesting: Wait for all threads to stop. Use PTRACE_GETREGS on every thread and save their registers in qcore's memory. These are critical for the final ELF PT_NOTE segment.
+
+The Safe Thread Hunt: To avoid destroying pending kernel restart states (ERESTARTSYS), you cannot blindly inject into a thread blocked in a syscall.
+
+Analyze the registers of the stopped threads. Find a thread that was executing in pure user-space (check instruction pointer and syscall registers).
+
+If all threads are stuck in syscalls, pick one and use ptrace(PTRACE_SYSCALL) to step it forward until it exactly hits a syscall-exit boundary, then pause it again.
+
+Phase 2: Parasite Injection
+Allocate Memory: Use ptrace to force the Safe Thread to execute an mmap syscall to allocate a small, executable memory region within the target process.
+
+Inject Payload: Write a pre-compiled "Parasite" shellcode payload (defined in Phase 3) into this allocated region.
+
+Hijack Execution: Save the original %rip, set %rip to the start of the Parasite, and let it run via ptrace(PTRACE_CONT).
+
+Phase 3: The Parasite Payload (Executes natively inside the target)
+You must write the assembly/C for this tiny payload. It executes directly in the target, without ptrace overhead.
+
+First Fork: Execute syscall(SYS_clone, 0, ...).
+
+Double-Fork (Stealth Drop):
+
+The Child (Child 1) immediately executes syscall(SYS_clone, 0, ...).
+
+Child 1 then immediately calls syscall(SYS_exit, 0).
+
+Result: The Grandchild (Child 2) is instantly orphaned and reparented to init. The target application's watchdogs never see it.
+
+FD Scrubbing: Child 2 loops from FD 0 to 1024, executing syscall(SYS_close, fd). This prevents its eventual death from triggering POSIX lock drops or io_uring teardowns in the parent.
+
+Pause: Child 2 executes raise(SIGSTOP) to wait for qcore.
+
+Parasite Exit: The original thread triggers an int3 (software breakpoint) to signal qcore that the payload has finished.
+
+Phase 4: Resume Target (Instantaneous)
+Catch Completion: qcore catches the SIGTRAP from the Parasite.
+
+Cleanup & Restore: qcore forces an munmap of the parasite memory, restores the original %rip and registers of the Safe Thread.
+
+Global Detach: qcore iterates through its TID list and calls ptrace(PTRACE_DETACH).
+Note: The target process is now fully resumed. Total pause time: < 5 milliseconds.
+
+Phase 5: External ELF Construction & I/O
+qcore now performs the heavy disk I/O externally to bypass security/namespace restrictions that Child 2 might have.
+
+Map Memory: Read /proc/[child_2_pid]/maps.
+
+Build ELF: Create a valid ELF64 core dump file:
+
+Write the ELF Header (ET_CORE).
+
+Write PT_LOAD segments for the mapped memory.
+
+Write the PT_NOTE segment. Crucial: Populate this using the parent thread registers harvested in Phase 1, not Child 2's registers.
+
+Dump RAM: Stream the physical memory from /proc/[child_2_pid]/mem into the file.
+
+Phase 6: Silent Assassination
+Send kill(child_2_pid, SIGKILL). Because it is orphaned and scrubbed, it vanishes without trace or side-effect.
+
+Constraints for the AI: Focus heavily on making Phase 1 (Safe Thread hunting) and Phase 3 (The Parasite payload) bulletproof. Comment the parasite assembly/shellcode extensively. Address how qcore will extract Child 2's PID (likely by having the parasite write it to a register before triggering the int3 trap).
