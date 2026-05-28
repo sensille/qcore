@@ -1,0 +1,8 @@
+*.o
+qcore
+test/target_simple
+test/target_mt
+test/target_sockets
+test/target_registers
+core.*
+*.json

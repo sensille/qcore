@@ -1,0 +1,79 @@
+Build a high-performance, low-latency core dumper for Linux (x86_64) named icgl (Instant Core GDB Loader).
+
+Unlike the standard gcore utility, icgl must achieve near-instantaneous process interruption by utilizing a ptrace + fork() Copy-On-Write (COW) strategy, combined with manual thread-state harvesting. Additionally, it must capture the state of all open sockets into a sidecar file.
+
+Please write this in C or Rust (optimize for safety, direct syscall access, and /proc filesystem parsing).
+
+Here is the exact architectural flow and state machine you must implement:
+
+Phase 1: Robust Seize and Harvest (Race-Condition Safe)
+
+Target Identification: Accept a target PID via command line arguments.
+
+Iterative Attach Loop: To prevent TOCTOU race conditions where threads spawn or die while you are attaching:
+
+Keep a tracking set of already-attached Thread IDs (TIDs).
+
+Loop: Read /proc/[pid]/task/. For any TID not in your set, call ptrace(PTRACE_ATTACH, tid).
+
+If ptrace returns ESRCH, gracefully ignore it (the thread exited).
+
+Repeat the directory read. Only break the loop when a full directory scan reveals no new, unattached TIDs.
+
+Wait & Harvest: Use waitpid to ensure every attached thread has reached a stopped state. For every stopped TID, use ptrace(PTRACE_GETREGS, tid, &regs) to read the CPU registers. Store these registers in memory for the ELF PT_NOTE segment later.
+
+Phase 2: Socket and File Descriptor Harvesting
+While the process is fully frozen, capture its external connections.
+
+Iterate through /proc/[pid]/fd/.
+
+Read the symlink of every file descriptor.
+
+If the symlink starts with socket:[inode], extract the inode number.
+
+Cross-reference that inode with /proc/net/tcp, /proc/net/udp, and /proc/net/unix to find the connection details (Local/Remote IP, Ports, and State).
+
+Store this information in memory to be written to a core.[pid].sockets.json file later. For non-socket FDs, simply record the symlink path.
+
+Phase 3: The COW Clone
+
+Select a Thread: Pick the main thread (or any currently paused thread) to act as the injector.
+
+Enable Fork Tracing: Set ptrace options on this thread to include PTRACE_O_TRACEFORK to catch the child.
+
+Backup Execution State: Read the exact memory at the current Instruction Pointer (%rip) using ptrace(PTRACE_PEEKTEXT) and save it.
+
+Inject Syscall: Overwrite the instructions at %rip with the machine code for a syscall instruction (0x0f 0x05 on x86_64).
+
+Execute Fork: Modify the thread's registers to invoke sys_fork (syscall number 57). Set %rax to 57. Use ptrace(PTRACE_SINGLESTEP) to force the thread to execute the injected fork() syscall.
+
+Catch the Child: Wait for the ptrace event indicating the fork is complete. Extract the new child PID using ptrace(PTRACE_GETEVENTMSG). The child is now created in a paused state, holding a perfect COW snapshot of the RAM.
+
+Phase 4: Resume Parent
+
+Restore: Restore the original instructions at %rip and restore the original registers for the injected thread.
+
+Global Detach: Iterate through all original TIDs in your tracking set and call ptrace(PTRACE_DETACH, tid, 0, 0).
+Note: At this exact moment, the parent process is fully running again. The interruption is over.
+
+Phase 5: Dump State to Disk
+
+Write the Socket JSON: Write the data harvested in Phase 2 to core.[pid].sockets.json.
+
+Map the Memory: Read /proc/[child_pid]/maps to determine the memory regions of the cloned process.
+
+Build the ELF File: Create a valid ELF64 core dump file on disk.
+
+Write the standard ELF Header (Type: ET_CORE).
+
+Write PT_LOAD segments for every mapped memory region (respecting read permissions).
+
+Write a PT_NOTE segment. Populate the PRSTATUS and PRPSINFO structures inside the PT_NOTE segment using the registers you harvested from the parent threads in Phase 1, not the child thread.
+
+Dump the RAM: Read the memory from /proc/[child_pid]/mem and stream it into the PT_LOAD segments.
+
+Phase 6: Cleanup
+
+Kill the Clone: Once the disk writes are complete, execute kill(child_pid, SIGKILL) to free the COW references.
+
+Please structure the code cleanly. Begin by generating the boilerplate and the race-condition-safe iterative thread seizing logic.
