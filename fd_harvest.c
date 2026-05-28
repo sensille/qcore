@@ -152,9 +152,9 @@ static void parse_net_table(fd_list_t *fds, const char *path,
             fi->type       = type4;   /* v4 or v6 determined by which file we parsed */
             fi->local_port = lport;
             fi->remote_port= rport;
-            strlcpy(fi->local_addr,  laddr, sizeof(fi->local_addr));
-            strlcpy(fi->remote_addr, raddr, sizeof(fi->remote_addr));
-            strlcpy(fi->state,       state_str, sizeof(fi->state));
+            strncpy(fi->local_addr,  laddr, sizeof(fi->local_addr));
+            strncpy(fi->remote_addr, raddr, sizeof(fi->remote_addr));
+            strncpy(fi->state,       state_str, sizeof(fi->state));
         }
     }
     fclose(f);
@@ -194,7 +194,7 @@ static void parse_net_unix(fd_list_t *fds, pid_t pid)
             fi->type = FD_TYPE_SOCKET_UNIX;
             snprintf(fi->state, sizeof(fi->state), "%s/%s",
                      unix_state_name(st), unix_type_name(type));
-            strlcpy(fi->unix_path, p, sizeof(fi->unix_path));
+            strncpy(fi->unix_path, p, sizeof(fi->unix_path));
         }
     }
     fclose(f);
@@ -236,7 +236,7 @@ int harvest_fds(qcore_state_t *state)
         if (!fi) { closedir(d); return -1; }
 
         fi->fd_num = fd_num;
-        strlcpy(fi->symlink, target, sizeof(fi->symlink));
+        strncpy(fi->symlink, target, sizeof(fi->symlink));
 
         if (strncmp(target, "socket:[", 8) == 0) {
             uint64_t inode = 0;

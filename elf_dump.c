@@ -97,7 +97,7 @@ static int parse_maps(pid_t pid, map_list_t *maps) {
         /* Trim leading space from name */
         char *np = name;
         while (*np == ' ') np++;
-        strlcpy(e->name, np, sizeof(e->name));
+        strncpy(e->name, np, sizeof(e->name));
 
         e->flags = 0;
         if (perms[0] == 'r') e->flags |= PF_R;
