@@ -18,15 +18,22 @@ $(TARGET): $(OBJS)
 
 # ---------------------------------------------------------------------------
 # Parasite shellcode pipeline
-#   1. Assemble parasite.S to an ELF object
-#   2. Link at virtual address 0, emit raw binary (position-independent)
-#   3. Convert raw binary to a C header with xxd
+#   1. Assemble parasite.S to an ELF object.
+#   2. Extract ONLY the .text section as a raw binary.
+#      We use objcopy -j .text rather than ld --oformat=binary because
+#      modern GCC adds .note.gnu.property (and possibly .comment) sections
+#      to the object file.  ld --oformat=binary includes all allocated
+#      sections; on distros where .note.gnu.property is placed at offset
+#      4096+, the resulting binary exceeds our 4096-byte code page and
+#      qcore refuses to load it.  objcopy -j .text extracts exactly the
+#      shellcode bytes and nothing else.
+#   3. Convert the raw binary to a C header with xxd.
 # ---------------------------------------------------------------------------
 parasite.o: parasite.S
 	$(CC) -c -o $@ $<
 
 parasite.bin: parasite.o
-	$(LD) -Ttext=0 --oformat=binary -o $@ $<
+	objcopy -j .text -O binary $< $@
 
 parasite.h: parasite.bin
 	xxd -i $< | sed 's/^unsigned char/static const unsigned char/' | sed 's/^unsigned int/static const unsigned int/' > $@
