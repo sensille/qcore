@@ -70,7 +70,7 @@ QCORE_OUT=""
 run_qcore() {
     local pid="$1"
     local out; out=$(mktemp /tmp/qcore_out_XXXXXX)
-    CLEANUP_FILES+=("$out" "core.$pid" "core.$pid.sockets.json" "core.$pid.threads.json")
+    CLEANUP_FILES+=("$out" "core.$pid" "core.$pid.fds.json" "core.$pid.threads.json")
     local invoke=("$QCORE" "$pid")
     [[ $EUID -ne 0 ]] && invoke=(sudo "${invoke[@]}")
     if "${invoke[@]}" >"$out" 2>&1; then
@@ -230,7 +230,7 @@ t_sockets_file() {
     start_target "$BIN_DIR/target_simple" || { fail "sockets_file: startup"; return; }
     local pid="$TARGET_PID"
     run_qcore "$pid" || { fail "sockets_file: qcore"; stop_target "$pid"; return; }
-    [[ -f "core.$pid.sockets.json" ]] \
+    [[ -f "core.$pid.fds.json" ]] \
         && pass "sockets_file: JSON created" \
         || fail "sockets_file: JSON missing"
     stop_target "$pid"
@@ -241,7 +241,7 @@ t_json_valid() {
     start_target "$BIN_DIR/target_sockets" || { fail "json_valid: startup"; return; }
     local pid="$TARGET_PID"
     run_qcore "$pid" || { fail "json_valid: qcore"; stop_target "$pid"; return; }
-    python3 -m json.tool "core.$pid.sockets.json" >/dev/null 2>&1 \
+    python3 -m json.tool "core.$pid.fds.json" >/dev/null 2>&1 \
         && pass "json_valid: well-formed JSON" \
         || fail "json_valid: malformed JSON"
     stop_target "$pid"
@@ -253,7 +253,7 @@ t_json_tcp() {
     local pid="$TARGET_PID"
     local port; port=$(field_of "tcp_port" "$TARGET_LINE")
     run_qcore "$pid" || { fail "json_tcp: qcore"; stop_target "$pid"; return; }
-    local j; j=$(cat "core.$pid.sockets.json" 2>/dev/null)
+    local j; j=$(cat "core.$pid.fds.json" 2>/dev/null)
     echo "$j" | grep -qE '"type".*"(tcp4|tcp6)"' && pass "json_tcp: type present" \
                                                    || fail "json_tcp: type missing"
     [[ -n "$port" ]] && echo "$j" | grep -q ":$port" \
@@ -270,7 +270,7 @@ t_json_fds() {
     local pid="$TARGET_PID"
     run_qcore "$pid" || { fail "json_fds: qcore"; stop_target "$pid"; return; }
     local count; count=$(python3 -c "
-import json; d=json.load(open('core.$pid.sockets.json')); print(len(d['fds']))" 2>/dev/null || echo 0)
+import json; d=json.load(open('core.$pid.fds.json')); print(len(d['fds']))" 2>/dev/null || echo 0)
     [[ "$count" -ge 3 ]] && pass "json_fds: $count FDs (>= stdin/stdout/stderr)" \
                           || fail "json_fds: too few FDs" "got $count"
     stop_target "$pid"

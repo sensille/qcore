@@ -5,7 +5,7 @@
  *
  * Produces:
  *   core.<pid>               ELF64 core loadable by gdb/lldb
- *   core.<pid>.sockets.json  socket and FD inventory
+ *   core.<pid>.fds.json  FD inventory
  *
  * Must run as root or with CAP_SYS_PTRACE.
  *
@@ -195,8 +195,8 @@ int main(int argc, char *argv[])
     state.safe_thread_idx  = -1;
     snprintf(state.core_path,         sizeof(state.core_path),
              "core.%d", (int)pid);
-    snprintf(state.sockets_json_path, sizeof(state.sockets_json_path),
-             "core.%d.sockets.json", (int)pid);
+    snprintf(state.fds_json_path, sizeof(state.fds_json_path),
+             "core.%d.fds.json", (int)pid);
     snprintf(state.threads_json_path, sizeof(state.threads_json_path),
              "core.%d.threads.json", (int)pid);
 
@@ -211,7 +211,7 @@ int main(int argc, char *argv[])
 
     printf("qcore: targeting PID %d\n", (int)pid);
     printf("  core:    %s\n", state.core_path);
-    printf("  sockets: %s\n", state.sockets_json_path);
+    printf("  fds:%s\n", state.fds_json_path);
     printf("  threads: %s\n", state.threads_json_path);
 
     /* Phase 1: Seize ------------------------------------------------ */
@@ -263,7 +263,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    write_sockets_json(&state);
+    write_fds_json(&state);
     write_threads_json(&state);
 
     int dump_ok = dump_core(&state);

@@ -294,11 +294,11 @@ static void json_str(FILE *f, const char *s) {
     fputc('"', f);
 }
 
-void write_sockets_json(const qcore_state_t *state)
+void write_fds_json(const qcore_state_t *state)
 {
-    FILE *f = fopen(state->sockets_json_path, "w");
+    FILE *f = fopen(state->fds_json_path, "w");
     if (!f) {
-        fprintf(stderr, "fopen(%s): %s\n", state->sockets_json_path, strerror(errno));
+        fprintf(stderr, "fopen(%s): %s\n", state->fds_json_path, strerror(errno));
         return;
     }
 
@@ -338,7 +338,7 @@ void write_sockets_json(const qcore_state_t *state)
 
     fprintf(f, "  ]\n}\n");
     fclose(f);
-    printf("[phase5] wrote socket info to %s\n", state->sockets_json_path);
+    printf("[phase5] wrote fd info to %s\n", state->fds_json_path);
 }
 
 void write_threads_json(const qcore_state_t *state)

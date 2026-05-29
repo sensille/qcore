@@ -120,7 +120,7 @@ typedef struct {
     pid_t    child2_pid;
 
     char core_path[256];
-    char sockets_json_path[256];
+    char fds_json_path[256];
     char threads_json_path[256];
 } qcore_state_t;
 
@@ -129,6 +129,6 @@ typedef struct {
 int  seize_all_threads(qcore_state_t *state);           /* seize.c      */
 void write_threads_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  harvest_fds(qcore_state_t *state);                 /* fd_harvest.c */
-void write_sockets_json(const qcore_state_t *state);    /* fd_harvest.c */
+void write_fds_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  inject_parasite(qcore_state_t *state);             /* inject.c     */
 int  dump_core(qcore_state_t *state);                   /* elf_dump.c   */
