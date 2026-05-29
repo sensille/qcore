@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -O0 -g -D_GNU_SOURCE
 TARGETS = target_simple target_mt target_sockets target_registers \
-          target_epoll target_children target_callstack
+          target_epoll target_children target_callstack target_idle
 
 .PHONY: all clean
 
@@ -23,6 +23,9 @@ target_epoll:    target_epoll.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 target_children: target_children.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+target_idle:     target_idle.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 # Built as PIE (the modern distro default) ON PURPOSE: a PIE binary forces

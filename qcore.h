@@ -112,6 +112,11 @@ typedef struct {
     thread_set_t threads;
     fd_list_t    fds;
 
+    /* Operating mode.  0 = safe (default): only inject into a thread at a
+     * clean point (user-space, or a syscall-exit reached via the race).
+     * 1 = force (-f): inject into any thread even if mid-syscall. */
+    int          force;
+
     /* Safe thread: the thread used for parasite injection.
      * Preference: a thread that was in user-space (orig_rax == -1)
      * so restoration is completely clean with no rip-2 restart. */

@@ -13,6 +13,8 @@ test/target_registers
 test/target_epoll
 test/target_children
 test/target_callstack
+test/target_idle
+test/verify_restart
 
 core.*
 *.json

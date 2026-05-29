@@ -67,11 +67,13 @@ start_target() {
 field_of() { echo "$2" | grep -oP "(?<=$1=)\S+"; }
 
 QCORE_OUT=""
+# run_qcore <pid> [extra qcore args...]
+# Extra args (e.g. -f) are passed to qcore before the pid.
 run_qcore() {
-    local pid="$1"
+    local pid="$1"; shift
     local out; out=$(mktemp /tmp/qcore_out_XXXXXX)
     CLEANUP_FILES+=("$out" "core.$pid" "core.$pid.fds.json" "core.$pid.threads.json")
-    local invoke=("$QCORE" "$pid")
+    local invoke=("$QCORE" "$@" "$pid")
     [[ $EUID -ne 0 ]] && invoke=(sudo "${invoke[@]}")
     if "${invoke[@]}" >"$out" 2>&1; then
         QCORE_OUT=$(cat "$out")
@@ -79,8 +81,8 @@ run_qcore() {
         return 0
     else
         QCORE_OUT=$(cat "$out")
-        echo "    qcore failed:" >&2
-        echo "$QCORE_OUT" | sed 's/^/    /' >&2
+        [[ $VERBOSE -eq 1 ]] && { echo "    qcore exited nonzero:" >&2
+                                 echo "$QCORE_OUT" | sed 's/^/    /' >&2; }
         return 1
     fi
 }
@@ -96,7 +98,7 @@ preflight() {
     local ok=1
     [[ -x "$QCORE" ]] || { echo "qcore not found at $QCORE - run 'make' first"; ok=0; }
     for t in target_simple target_mt target_sockets target_registers \
-              target_epoll target_children target_callstack; do
+              target_epoll target_children target_callstack target_idle; do
         [[ -x "$BIN_DIR/$t" ]] || { echo "Missing: $BIN_DIR/$t"; ok=0; }
     done
     for cmd in readelf file strings; do
@@ -502,22 +504,22 @@ t_repeated_runs() {
     stop_target "$pid"
 }
 
-# -- Old failure: ERESTARTNOHAND -> -EINTR in epoll_wait thread -------------
-section "Regression: epoll_wait thread (was: ERESTARTNOHAND forced -EINTR)"
+# -- epoll thread survives a forced dump ------------------------------------
+section "Regression: epoll_wait thread under -f (benign EINTR, survives)"
 
 t_epoll_no_eintr() {
+    # target_epoll is single-threaded and blocks forever in epoll_wait, so it
+    # is the fully-idle case: safe mode correctly refuses it (tested
+    # elsewhere).  Here we force a dump with -f and verify the target survives
+    # the one benign -EINTR that epoll_wait surfaces -- exactly what any
+    # signal would cause, and what a correct epoll loop handles by retrying.
     start_target "$BIN_DIR/target_epoll" || { fail "epoll: startup"; return; }
     local pid="$TARGET_PID"
-    run_qcore "$pid" || { fail "epoll: qcore failed"; stop_target "$pid"; return; }
-    # Primary check: target must still be alive.  A runaway -EINTR loop
-    # from a broken rip-2 restart would crash the process.
-    # (Note: we do NOT send SIGUSR1 to query the count because SIGUSR1
-    # delivery itself interrupts epoll_wait with -EINTR, which would be
-    # a measurement artifact, not a qcore side-effect.)
+    run_qcore "$pid" -f || { fail "epoll: qcore -f failed"; stop_target "$pid"; return; }
     if kill -0 "$pid" 2>/dev/null; then
-        pass "epoll: target alive after dump (no fatal -EINTR from epoll_wait)"
+        pass "epoll: target alive after forced dump (benign EINTR handled)"
     else
-        fail "epoll: target dead after dump (was: rip-2 restart broke epoll_wait)"
+        fail "epoll: target dead after forced dump"
     fi
     stop_target "$pid"
 }
@@ -751,20 +753,72 @@ t_callstack_frames() {
     stop_target "$pid"
 }
 
-# -- Old failure: safe thread was in syscall (verify we used user-space) ----
+# -- Injector is always a clean point in safe mode -------------------------
 section "Parasite quality: injection point"
 
-t_safe_thread_was_userspace() {
-    start_target "$BIN_DIR/target_simple" || { fail "safe_thread: startup"; return; }
+t_safe_injector_is_clean() {
+    # In default (safe) mode the injector must be either a user-space thread
+    # or a syscall-exit reached via the race -- never a forced mid-syscall
+    # hijack.  target_simple idles in nanosleep, so the race wins quickly.
+    start_target "$BIN_DIR/target_simple" || { fail "injector: startup"; return; }
     local pid="$TARGET_PID"
-    run_qcore "$pid" || { fail "safe_thread: qcore"; stop_target "$pid"; return; }
-    if echo "$QCORE_OUT" | grep -q "was in user-space"; then
-        pass "safe_thread: injected at user-space thread (cleanest path)"
-    elif echo "$QCORE_OUT" | grep -q "was in syscall"; then
-        pass "safe_thread: injected at syscall-blocked thread (rip-2 restart)"
+    run_qcore "$pid" || { fail "injector: qcore"; stop_target "$pid"; return; }
+    if echo "$QCORE_OUT" | grep -qE "injector .*(user-space \(clean\)|syscall-exit \(clean)"; then
+        pass "injector: safe mode used a clean injection point"
     else
-        fail "safe_thread: injection point not reported in qcore output"
+        fail "injector: safe mode did not report a clean injection point" \
+             "$(echo "$QCORE_OUT" | grep -i injector)"
     fi
+    echo "$QCORE_OUT" | grep -q "forced" \
+        && fail "injector: safe mode unexpectedly forced a mid-syscall hijack" \
+        || pass "injector: safe mode did not force a hijack"
+    stop_target "$pid"
+}
+
+# -- Safe mode refuses a fully-idle target; -f forces it --------------------
+section "Safe mode vs force mode (fully idle target)"
+
+t_safe_mode_refuses_idle() {
+    # target_idle blocks forever in pause(); no thread ever reaches a
+    # syscall-exit, so safe mode must time out and refuse.  Use a short race
+    # timeout so the test is fast.
+    start_target "$BIN_DIR/target_idle" || { fail "idle_refuse: startup"; return; }
+    local pid="$TARGET_PID"
+    local out; out=$(mktemp /tmp/qcore_out_XXXXXX)
+    CLEANUP_FILES+=("$out" "core.$pid" "core.$pid.fds.json" "core.$pid.threads.json")
+    local invoke=(env QCORE_RACE_TIMEOUT_SEC=2 "$QCORE" "$pid")
+    [[ $EUID -ne 0 ]] && invoke=(sudo "${invoke[@]}")
+    if "${invoke[@]}" >"$out" 2>&1; then
+        fail "idle_refuse: safe mode should have refused but succeeded"
+    else
+        pass "idle_refuse: safe mode refused the fully-idle target"
+    fi
+    grep -q "f to force" "$out" \
+        && pass "idle_refuse: refusal message advises -f" \
+        || fail "idle_refuse: refusal message missing -f advice" "$(cat $out)"
+    kill -0 "$pid" 2>/dev/null \
+        && pass "idle_refuse: target still alive after refusal" \
+        || fail "idle_refuse: target died (refusal should be harmless)"
+    [[ ! -f "core.$pid" ]] \
+        && pass "idle_refuse: no core file produced" \
+        || fail "idle_refuse: a core file was produced despite refusal"
+    stop_target "$pid"
+}
+
+t_force_mode_dumps_idle() {
+    # With -f, qcore hijacks the blocked thread and dumps successfully.
+    start_target "$BIN_DIR/target_idle" || { fail "idle_force: startup"; return; }
+    local pid="$TARGET_PID"
+    run_qcore "$pid" -f || { fail "idle_force: qcore -f failed"; stop_target "$pid"; return; }
+    [[ -f "core.$pid" ]] \
+        && pass "idle_force: -f produced a core on the idle target" \
+        || fail "idle_force: no core produced under -f"
+    kill -0 "$pid" 2>/dev/null \
+        && pass "idle_force: target still alive after -f dump" \
+        || fail "idle_force: target died after -f dump"
+    echo "$QCORE_OUT" | grep -q "forced" \
+        && pass "idle_force: qcore reported forced injection" \
+        || fail "idle_force: expected 'forced' in output"
     stop_target "$pid"
 }
 
@@ -839,12 +893,18 @@ main() {
     section "Core dump quality: stack frames and thread registers"
     t_callstack_frames
 
+    section "Parasite quality: injection point"
+    t_safe_injector_is_clean
+
+    section "Safe mode vs force mode (fully idle target)"
+    t_safe_mode_refuses_idle
+    t_force_mode_dumps_idle
+
     section "Failure-scenario regressions"
     t_repeated_runs
     t_epoll_no_eintr
     t_child_invisible
     t_tcp_socket_alive
-    t_safe_thread_was_userspace
     t_child2_invisible_after_dump
 
     echo ""

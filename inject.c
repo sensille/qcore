@@ -1,63 +1,47 @@
 /*
  * inject.c - Phases 2-4: parasite injection, execution, and teardown.
  *
- * Safe-thread selection
- * ---------------------
- * Prefer a thread that was in pure user-space (orig_rax == -1) when
- * PTRACE_INTERRUPT stopped it.  Prefer non-main threads over the main
- * thread to avoid disrupting the application's event loop.
- * Fall back to any thread if needed.
+ * Choosing the injector thread (safe vs force mode)
+ * -------------------------------------------------
+ * We hijack one thread to run mmap, the parasite, and munmap.  The safest
+ * possible injector is one stopped at a "clean" point:
  *
- * mmap/munmap injection
- * ---------------------
- * Both mmap and munmap are injected via exec_syscall_at, which uses
- * PTRACE_SINGLESTEP from the original PTRACE_EVENT_STOP state.
+ *   - pure user-space (orig_rax == -1): restoring its registers is a
+ *     perfect no-op; the thread never notices.
+ *   - a syscall-EXIT boundary: the syscall already completed with a real
+ *     return value, so restoring the registers returns that value normally.
  *
- * Why PTRACE_SINGLESTEP works cleanly here:
- *   - The thread is at PTRACE_EVENT_STOP from PTRACE_INTERRUPT.
- *   - PT_SYSCALL (TIF_SYSCALL_TRACE) is NOT set -- we never called
- *     PTRACE_SYSCALL -- so there is no two-stop problem.
- *   - When PTRACE_SINGLESTEP resumes from PTRACE_EVENT_STOP, do_signal()
- *     fires (TIF_SIGPENDING from PTRACE_INTERRUPT), clears TIF_SIGPENDING,
- *     and the thread executes exactly one instruction (our mmap syscall).
- *     Exactly one SIGTRAP is generated.
+ * In neither case is a kernel restart code in play, so there is zero
+ * ambiguity and zero -EINTR risk for the injector.
  *
- * Why we do NOT use PTRACE_SYSCALL for injection:
- *   PTRACE_SYSCALL from PTRACE_EVENT_STOP may not produce a syscall-exit
- *   stop for the already-interrupted blocking syscall (the signal-delivery
- *   path bypasses the normal syscall-exit checkpoint).  The thread then
- *   re-enters the blocking call and waitpid hangs.
+ * Safe mode (default): if no thread is already in user-space, we "race to
+ * the exit" -- resume all threads under PTRACE_SYSCALL so the application
+ * runs normally, and wait for ANY thread to reach a syscall-exit (an epoll
+ * loop returns, a read completes, ...).  The instant one does, we freeze
+ * everyone again and use that thread as a guaranteed-clean injector.
+ * If nothing reaches an exit within the timeout (a fully idle process with
+ * every thread parked forever), we give up and tell the user to use -f.
  *
- * Parasite execution
- * ------------------
- * After mmap, PTRACE_CONT runs the parasite natively.  PTRACE_CONT clears
- * TIF_SYSCALL_TRACE (not that it was set, but belt-and-suspenders).  The
- * parasite's own clone() calls are not intercepted.  The munmap injection
- * after the int3 trap also uses PTRACE_SINGLESTEP -- safe because no
- * PT_SYSCALL is active and PTRACE_CONT further ensured a clean state.
+ * Force mode (-f): skip the race and hijack any thread, even one stopped
+ * mid-syscall.  On restore we put back its exact original registers,
+ * including any ERESTART* code in rax; detaching with signal 0 lets the
+ * kernel transparently restart the interrupted syscall (verified for
+ * ERESTARTSYS/NOINTR/RESTARTBLOCK).  epoll_wait threads still surface a
+ * benign -EINTR, exactly as any signal would.
  *
- * Restoration
- * -----------
- * Injector thread: restore safe_saved_regs.
- *   - orig_rax == -1 (user-space): plain restore, nothing to fix.
- *   - otherwise: if rax contains a kernel restart code or equals orig_rax
- *     (syscall-entry state where rax == syscall number), replace rax with
- *     -EINTR.  The application sees a normal EINTR error return.
+ * mmap/munmap injection uses exec_syscall_at (PTRACE_SINGLESTEP from a
+ * non-syscall stop -- one stop, no ambiguity).  The parasite runs via
+ * PTRACE_CONT.
  *
- *   We deliberately do NOT use rip-2.  rip-2 re-executes the syscall from
- *   scratch, which is unsafe for stateful syscalls: io_uring_enter may have
- *   already consumed submission queue entries, nanosleep loses its remaining
- *   timeout, partial write() sends data twice, etc.  -EINTR is always safe.
- *
- * Non-injector threads: plain PTRACE_DETACH.  TIF_SIGPENDING is still set
- * (from PTRACE_INTERRUPT), so arch_do_signal_or_restart() fires on detach
- * and handles each syscall's restart semantics correctly:
- *   ERESTARTSYS / ERESTARTNOINTR  -> transparent kernel restart
- *   ERESTARTNOHAND / RESTARTBLOCK -> -EINTR to user-space
- * We do NOT call PTRACE_SETREGS on non-injector threads.
+ * Restore: we always write back the exact saved registers and detach with
+ * 0.  For a clean injector there is no restart code; for a force-mode
+ * mid-syscall injector the kernel restarts via the signr==0 path.  We never
+ * use rip-2 (re-executing a stateful syscall from scratch is unsafe).
  */
 
 #include "qcore.h"
+#include <sys/uio.h>
+#include <linux/ptrace.h>   /* struct ptrace_syscall_info, PTRACE_GET_SYSCALL_INFO */
 #include "parasite.h"
 
 #define PARASITE_PAGES      3
@@ -70,15 +54,10 @@
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 
-static int is_restart_code(long long rax)
-{
-    switch (rax) {
-    case -512: case -513: case -514: case -516:
-        return 1;
-    default:
-        return 0;
-    }
-}
+/* How long safe mode waits for a thread to reach a syscall-exit before
+ * giving up and advising -f.  A process with every thread parked forever
+ * in a blocking syscall never yields a clean point. */
+#define QCORE_RACE_TIMEOUT_SEC 10
 
 /*
  * Execute a single syscall in tid's context at rip via PTRACE_SINGLESTEP.
@@ -148,34 +127,210 @@ static int poke_bytes(pid_t tid, uint64_t addr,
 }
 
 /* ------------------------------------------------------------------ */
-/* Safe thread selection                                               */
+/* Injector selection                                                  */
 
-static int find_safe_thread(qcore_state_t *state)
+/* Index of the entry for tid, or -1. */
+static int thread_index(const qcore_state_t *state, pid_t tid)
+{
+    for (int i = 0; i < state->threads.count; i++)
+        if (state->threads.data[i].tid == tid) return i;
+    return -1;
+}
+
+/*
+ * A thread is "user-space clean" if it was executing user code (not in a
+ * syscall) when stopped.  Such a thread is the ideal injector.
+ * Prefer non-main threads to avoid disturbing the main event loop.
+ */
+static int find_userspace_injector(const qcore_state_t *state)
 {
     pid_t main_tid = state->target_pid;
-
-    /* 1. Non-main thread in user-space (orig_rax == -1). */
     for (int i = 0; i < state->threads.count; i++) {
         const thread_info_t *t = &state->threads.data[i];
         if (!t->regs_valid || t->tid == main_tid) continue;
         if (t->regs.orig_rax == (unsigned long long)-1) return i;
     }
-    /* 2. Main thread in user-space. */
     for (int i = 0; i < state->threads.count; i++) {
         const thread_info_t *t = &state->threads.data[i];
         if (!t->regs_valid || t->tid != main_tid) continue;
         if (t->regs.orig_rax == (unsigned long long)-1) return i;
     }
-    /* 3. Any non-main thread (will get -EINTR on restore). */
-    for (int i = 0; i < state->threads.count; i++) {
-        const thread_info_t *t = &state->threads.data[i];
-        if (t->regs_valid && t->tid != main_tid) return i;
-    }
-    /* 4. Main thread as last resort. */
-    for (int i = 0; i < state->threads.count; i++) {
-        if (state->threads.data[i].regs_valid) return i;
-    }
     return -1;
+}
+
+/* Force-mode fallback: any valid thread, non-main preferred. */
+static int find_any_injector(const qcore_state_t *state)
+{
+    pid_t main_tid = state->target_pid;
+    for (int i = 0; i < state->threads.count; i++)
+        if (state->threads.data[i].regs_valid &&
+            state->threads.data[i].tid != main_tid) return i;
+    for (int i = 0; i < state->threads.count; i++)
+        if (state->threads.data[i].regs_valid) return i;
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Race to the syscall-exit                                            */
+
+/* Is this stop a syscall-exit (vs entry)?  Prefer the authoritative
+ * PTRACE_GET_SYSCALL_INFO; fall back to the x86-64 convention that rax ==
+ * -ENOSYS at syscall-entry. */
+static int at_syscall_exit(pid_t tid, const struct user_regs_struct *r)
+{
+#ifdef PTRACE_GET_SYSCALL_INFO
+    struct ptrace_syscall_info si;
+    long n = ptrace(PTRACE_GET_SYSCALL_INFO, tid,
+                    (void *)sizeof(si), &si);
+    if (n > 0) return si.op == PTRACE_SYSCALL_INFO_EXIT;
+#endif
+    return (long long)r->rax != -38 /* -ENOSYS */;
+}
+
+/* Re-freeze every thread except the winner with PTRACE_INTERRUPT, wait for
+ * each to stop, and refresh all saved registers so PT_NOTE reflects the
+ * frozen instant. */
+static void refreeze_others(qcore_state_t *state, pid_t winner_tid)
+{
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t tid = state->threads.data[i].tid;
+        if (tid <= 0 || tid == winner_tid) continue;
+        ptrace(PTRACE_INTERRUPT, tid, 0, 0);
+    }
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t tid = state->threads.data[i].tid;
+        if (tid <= 0 || tid == winner_tid) continue;
+        int st;
+        if (waitpid(tid, &st, __WALL) == -1) { state->threads.data[i].tid = -1; continue; }
+        if (!WIFSTOPPED(st)) { state->threads.data[i].tid = -1; continue; }
+        ptrace(PTRACE_GETREGS, tid, NULL, &state->threads.data[i].regs);
+    }
+}
+
+/* SIGALRM handler for the race timeout: just interrupts the blocking
+ * waitpid via EINTR. */
+static volatile sig_atomic_t g_race_timed_out;
+static void race_alarm(int sig) { (void)sig; g_race_timed_out = 1; }
+
+/*
+ * Resume all threads under PTRACE_SYSCALL and wait for any one to reach a
+ * syscall-exit, giving a guaranteed-clean injector.  Re-freeze the rest.
+ * Returns the injector's thread index, or -1 on timeout/error (in which
+ * case all threads are left stopped for the caller to detach).
+ */
+static int race_for_injector(qcore_state_t *state, int timeout_sec)
+{
+    /* Enable clean syscall-stop reporting and child tracking. */
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t tid = state->threads.data[i].tid;
+        if (tid <= 0) continue;
+        ptrace(PTRACE_SETOPTIONS, tid, 0,
+               (void *)(long)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE));
+    }
+
+    /* Resume every thread under syscall-tracing; the app now runs. */
+    int running = 0;
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t tid = state->threads.data[i].tid;
+        if (tid <= 0) continue;
+        if (ptrace(PTRACE_SYSCALL, tid, 0, 0) == 0) running++;
+    }
+    if (running == 0) return -1;
+
+    printf("[phase2] no user-space thread; racing %d thread(s) "
+           "to a syscall-exit (timeout %ds)\n", running, timeout_sec);
+
+    /* Arm the timeout. */
+    g_race_timed_out = 0;
+    struct sigaction old_alarm, sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = race_alarm;       /* no SA_RESTART: must interrupt waitpid */
+    sigaction(SIGALRM, &sa, &old_alarm);
+    alarm((unsigned)timeout_sec);
+
+    int winner_idx = -1;
+    while (winner_idx < 0 && !g_race_timed_out) {
+        int status;
+        pid_t tid = waitpid(-1, &status, __WALL);
+        if (tid == -1) {
+            if (errno == EINTR) break;     /* timeout */
+            perror("waitpid (race)");
+            break;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            int idx = thread_index(state, tid);
+            if (idx >= 0) state->threads.data[idx].tid = -1;
+            continue;
+        }
+        if (!WIFSTOPPED(status)) continue;
+
+        int sig = WSTOPSIG(status);
+
+        /* Syscall-trace stop is reported as SIGTRAP|0x80 (TRACESYSGOOD). */
+        if (sig == (SIGTRAP | 0x80)) {
+            struct user_regs_struct r;
+            if (ptrace(PTRACE_GETREGS, tid, NULL, &r) == 0 &&
+                at_syscall_exit(tid, &r)) {
+                int idx = thread_index(state, tid);
+                if (idx >= 0) {
+                    state->threads.data[idx].regs = r;   /* clean exit regs */
+                    state->threads.data[idx].regs_valid = 1;
+                    winner_idx = idx;
+                    break;
+                }
+            }
+            /* Entry stop (or unknown thread): let it proceed. */
+            ptrace(PTRACE_SYSCALL, tid, 0, 0);
+            continue;
+        }
+
+        /* PTRACE_EVENT stops (new thread via clone, etc.) and group-stops
+         * (SIGSTOP/SIGTSTP) and plain SIGTRAP: resume without injecting a
+         * signal.  This also safely handles a brand-new thread's initial
+         * stop -- we just keep it running rather than forwarding a bogus
+         * stop signal. */
+        if (sig == SIGTRAP || sig == SIGSTOP || sig == SIGTSTP ||
+            sig == SIGTTIN || sig == SIGTTOU || thread_index(state, tid) < 0) {
+            ptrace(PTRACE_SYSCALL, tid, 0, 0);
+            continue;
+        }
+
+        /* A real signal to a known thread: forward it so the application
+         * behaves exactly as it would have without qcore present. */
+        ptrace(PTRACE_SYSCALL, tid, 0, (void *)(long)sig);
+    }
+
+    alarm(0);
+    sigaction(SIGALRM, &old_alarm, NULL);
+
+    if (winner_idx < 0) {
+        /* Timeout: freeze everyone so the caller can detach cleanly. */
+        for (int i = 0; i < state->threads.count; i++) {
+            if (state->threads.data[i].tid > 0)
+                ptrace(PTRACE_INTERRUPT, state->threads.data[i].tid, 0, 0);
+        }
+        for (int i = 0; i < state->threads.count; i++) {
+            pid_t tid = state->threads.data[i].tid;
+            if (tid <= 0) continue;
+            int st;
+            if (waitpid(tid, &st, __WALL) > 0 && WIFSTOPPED(st))
+                ptrace(PTRACE_GETREGS, tid, NULL, &state->threads.data[i].regs);
+        }
+        return -1;
+    }
+
+    /* Clear syscall-trace options on the winner before we inject: we are
+     * about to PTRACE_SINGLESTEP an injected syscall on it, and leaving
+     * PTRACE_O_TRACESYSGOOD set could make the step double-stop (a syscall
+     * stop plus the singlestep trap), confusing exec_syscall_at. */
+    ptrace(PTRACE_SETOPTIONS, state->threads.data[winner_idx].tid, 0, 0);
+
+    /* Winner found and stopped at a clean exit; freeze the rest. */
+    refreeze_others(state, state->threads.data[winner_idx].tid);
+    printf("[phase2] race winner TID=%d at syscall-exit\n",
+           (int)state->threads.data[winner_idx].tid);
+    return winner_idx;
 }
 
 /* ------------------------------------------------------------------ */
@@ -204,16 +359,16 @@ static void restore_safe_thread(qcore_state_t *state, pid_t safe_tid,
         state->mmap_addr = 0;
     }
 
-    /* Restore original registers.  Convert an interrupted syscall's restart
-     * code (or syscall-entry state where rax == orig_rax) to -EINTR; never
-     * rip-2 (re-executing stateful syscalls is unsafe). */
-    struct user_regs_struct restore_regs = state->safe_saved_regs;
-    if (restore_regs.orig_rax != (unsigned long long)-1) {
-        if (is_restart_code((long long)restore_regs.rax) ||
-            restore_regs.rax == restore_regs.orig_rax)
-            restore_regs.rax = (unsigned long long)(-EINTR);
-    }
-    ptrace(PTRACE_SETREGS, safe_tid, NULL, &restore_regs);
+    /* Restore the EXACT original registers and let the kernel sort out
+     * any pending syscall restart on detach (signr==0 path):
+     *   - clean injector (user-space / syscall-exit): no restart code, the
+     *     thread simply continues -- perfectly transparent.
+     *   - force-mode mid-syscall injector: rax holds an ERESTART* code and
+     *     the kernel transparently restarts the syscall.  (epoll_wait will
+     *     already hold -EINTR, a benign value.)
+     * We never rip-2 and never synthesise -EINTR. */
+    ptrace(PTRACE_SETREGS, safe_tid, NULL,
+           (struct user_regs_struct *)&state->safe_saved_regs);
     state->safe_bytes_modified = 0;
 }
 
@@ -222,11 +377,35 @@ static void restore_safe_thread(qcore_state_t *state, pid_t safe_tid,
 
 int inject_parasite(qcore_state_t *state)
 {
-    /* ---- 1. Select safe thread ------------------------------------ */
-    int sidx = find_safe_thread(state);
+    /* ---- 1. Select the injector thread ---------------------------- */
+    /* Best case: a thread already in user-space.  Otherwise, in safe mode
+     * race to a syscall-exit; in force mode hijack any thread. */
+    int sidx = find_userspace_injector(state);
+    const char *how = "user-space (clean)";
     if (sidx < 0) {
-        fprintf(stderr, "[inject] no usable injection thread\n");
-        return -1;
+        if (!state->force) {
+            int timeout = QCORE_RACE_TIMEOUT_SEC;
+            const char *env = getenv("QCORE_RACE_TIMEOUT_SEC");
+            if (env) { int v = atoi(env); if (v > 0) timeout = v; }
+            sidx = race_for_injector(state, timeout);
+            how = "syscall-exit (clean, via race)";
+            if (sidx < 0) {
+                fprintf(stderr,
+                    "[inject] no thread reached a safe injection point within "
+                    "%ds.\n          The target appears fully idle in blocking "
+                    "syscalls.\n          Re-run with -f to force injection "
+                    "(may surface a benign -EINTR).\n",
+                    timeout);
+                return -1;   /* race left all threads frozen; caller detaches */
+            }
+        } else {
+            sidx = find_any_injector(state);
+            how = "forced (-f; mid-syscall, kernel will restart)";
+            if (sidx < 0) {
+                fprintf(stderr, "[inject] no usable injection thread\n");
+                return -1;
+            }
+        }
     }
     state->safe_thread_idx = sidx;
 
@@ -234,11 +413,8 @@ int inject_parasite(qcore_state_t *state)
     uint64_t rip   = state->threads.data[sidx].regs.rip;
     state->safe_saved_regs = state->threads.data[sidx].regs;
 
-    int userspace = (state->safe_saved_regs.orig_rax == (unsigned long long)-1);
-    printf("[phase2] safe thread TID=%d  RIP=0x%llx  %s\n",
-           (int)safe_tid, (unsigned long long)rip,
-           userspace ? "(was in user-space)"
-                     : "(was in syscall - will return -EINTR)");
+    printf("[phase2] injector TID=%d  RIP=0x%llx  %s\n",
+           (int)safe_tid, (unsigned long long)rip, how);
 
     double t_mmap_start = qcore_now_ms();
 

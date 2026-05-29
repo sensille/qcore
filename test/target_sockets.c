@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include "idle_loop.h"
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -55,7 +56,7 @@ int main(void)
            getpid(), tcp_port, unix_path);
     fflush(stdout);
 
-    while (1) pause();
+    qcore_idle_loop();
 
     close(tcp_fd);
     close(unix_fd);

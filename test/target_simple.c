@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include "idle_loop.h"
 
 /* Placed in BSS so it ends up in a PT_LOAD segment. */
 static volatile char heap_marker[64];
@@ -19,5 +20,5 @@ int main(void)
     printf("ready pid=%d\n", getpid());
     fflush(stdout);
 
-    while (1) pause();   /* re-enter after -EINTR from ptrace detach */
+    qcore_idle_loop();
 }

@@ -158,7 +158,12 @@ static pid_t translate_ns_pid(pid_t target_pid, pid_t ns_local_pid)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s <pid>\n", prog);
+    fprintf(stderr,
+        "Usage: %s [-f] <pid>\n"
+        "  -f   force: inject into any thread even if all are mid-syscall.\n"
+        "       Default (safe) mode waits for a thread to reach a clean\n"
+        "       point and refuses rather than risk disturbing the target.\n",
+        prog);
 }
 
 static void check_alive(pid_t pid, const char *label)
@@ -172,11 +177,19 @@ static void check_alive(pid_t pid, const char *label)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 2) { usage(argv[0]); return 1; }
+    int force = 0;
+    int opt;
+    while ((opt = getopt(argc, argv, "f")) != -1) {
+        switch (opt) {
+        case 'f': force = 1; break;
+        default:  usage(argv[0]); return 1;
+        }
+    }
+    if (optind != argc - 1) { usage(argv[0]); return 1; }
 
-    pid_t pid = (pid_t)((int)strtol(argv[1], NULL, 10));
+    pid_t pid = (pid_t)((int)strtol(argv[optind], NULL, 10));
     if (pid <= 0) {
-        fprintf(stderr, "Invalid PID: %s\n", argv[1]);
+        fprintf(stderr, "Invalid PID: %s\n", argv[optind]);
         return 1;
     }
 
@@ -193,6 +206,7 @@ int main(int argc, char *argv[])
     state.target_pid       = pid;
     state.child2_pid       = -1;
     state.safe_thread_idx  = -1;
+    state.force            = force;
     snprintf(state.core_path,         sizeof(state.core_path),
              "core.%d", (int)pid);
     snprintf(state.fds_json_path, sizeof(state.fds_json_path),

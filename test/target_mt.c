@@ -8,13 +8,14 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <unistd.h>
+#include "idle_loop.h"
 
 #define N_WORKERS 7   /* +1 for main -> 8 total threads */
 
 static void *worker(void *arg)
 {
     (void)arg;
-    while (1) pause();
+    qcore_idle_loop();
     return NULL;
 }
 
@@ -27,5 +28,5 @@ int main(void)
     printf("ready pid=%d threads=%d\n", getpid(), N_WORKERS + 1);
     fflush(stdout);
 
-    while (1) pause();
+    qcore_idle_loop();
 }
