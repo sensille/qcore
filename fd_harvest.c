@@ -355,7 +355,10 @@ void write_threads_json(const qcore_state_t *state)
 
     for (int i = 0; i < state->threads.count; i++) {
         const thread_info_t *t = &state->threads.data[i];
-        fprintf(f, "    {\"tid\": %d, \"name\": ", (int)t->tid);
+        fprintf(f, "    {\"tid\": %d", (int)t->tid);
+        if (t->ns_tid != t->tid)
+            fprintf(f, ", \"ns_tid\": %d", (int)t->ns_tid);
+        fprintf(f, ", \"name\": ");
         json_str(f, t->name[0] ? t->name : "");
         fprintf(f, "}");
         if (i + 1 < state->threads.count) fputc(',', f);

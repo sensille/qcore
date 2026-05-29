@@ -119,21 +119,44 @@ int seize_all_threads(qcore_state_t *state)
                     (int)t->tid, strerror(errno));
         }
 
-        /* Read the thread's name from /proc/<pid>/task/<tid>/comm.
-         * The kernel truncates it to 15 chars + newline. */
+        /* Read the thread's name and namespace-local TID from
+         * /proc/<pid>/task/<tid>/status in one pass.
+         *
+         * NSpid lists PIDs from outermost (root/host) to innermost
+         * (container) namespace.  The last value is the TID as seen
+         * from inside the container; equals t->tid when not nested. */
+        t->ns_tid = t->tid;   /* default: same namespace */
         {
-            char comm_path[64];
-            snprintf(comm_path, sizeof(comm_path),
-                     "/proc/%d/task/%d/comm",
+            char status_path[64];
+            snprintf(status_path, sizeof(status_path),
+                     "/proc/%d/task/%d/status",
                      (int)state->target_pid, (int)t->tid);
-            FILE *cf = fopen(comm_path, "r");
-            if (cf) {
-                char *_r __attribute__((unused)) =
-                    fgets(t->name, sizeof(t->name), cf);
-                fclose(cf);
-                /* Strip trailing newline */
-                char *nl = strchr(t->name, '\n');
-                if (nl) *nl = '\0';
+            FILE *sf = fopen(status_path, "r");
+            if (sf) {
+                char line[256];
+                while (fgets(line, sizeof(line), sf)) {
+                    if (strncmp(line, "Name:", 5) == 0) {
+                        char *p = line + 5;
+                        while (*p == '\t' || *p == ' ') p++;
+                        strncpy(t->name, p, sizeof(t->name) - 1);
+                        t->name[sizeof(t->name) - 1] = '\0';
+                        char *nl = strchr(t->name, '\n');
+                        if (nl) *nl = '\0';
+                    } else if (strncmp(line, "NSpid:", 6) == 0) {
+                        /* Parse all whitespace-separated values; keep last. */
+                        char *p = line + 6;
+                        long last = t->tid;
+                        while (*p) {
+                            char *end;
+                            long v = strtol(p, &end, 10);
+                            if (end == p) break;
+                            last = v;
+                            p = end;
+                        }
+                        t->ns_tid = (pid_t)last;
+                    }
+                }
+                fclose(sf);
             }
         }
         valid++;

@@ -318,6 +318,9 @@ for t in threads:
     assert "name" in t, "missing name field"
     assert isinstance(t["tid"],  int), "tid must be int"
     assert isinstance(t["name"], str), "name must be str"
+    if "ns_tid" in t:
+        assert isinstance(t["ns_tid"], int), "ns_tid must be int"
+        assert t["ns_tid"] > 0, "ns_tid must be positive"
 # Every entry must have a unique TID.
 tids = [t["tid"] for t in threads]
 assert len(tids) == len(set(tids)), "duplicate TIDs"

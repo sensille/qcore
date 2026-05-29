@@ -41,6 +41,7 @@ typedef struct {
     struct user_regs_struct regs;
     int                     regs_valid;
     char                    name[16];   /* from /proc/<pid>/task/<tid>/comm */
+    pid_t                   ns_tid;     /* innermost-namespace TID; equals tid when not in a container */
 } thread_info_t;
 
 typedef struct {
