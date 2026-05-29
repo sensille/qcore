@@ -96,7 +96,7 @@ preflight() {
     local ok=1
     [[ -x "$QCORE" ]] || { echo "qcore not found at $QCORE - run 'make' first"; ok=0; }
     for t in target_simple target_mt target_sockets target_registers \
-              target_epoll target_children; do
+              target_epoll target_children target_callstack; do
         [[ -x "$BIN_DIR/$t" ]] || { echo "Missing: $BIN_DIR/$t"; ok=0; }
     done
     for cmd in readelf file strings; do
@@ -459,6 +459,178 @@ except (ConnectionRefusedError, OSError) as e:
     stop_target "$pid"
 }
 
+# -- Core dump quality: stack frames ----------------------------------------
+#
+# This section is the only test that checks whether the core is actually
+# useful for debugging.  The existing GDB tests (t_gdb_backtrace etc.) accept
+# "?? ()" frames as a pass; this test requires named symbols in the correct
+# call order, proving that:
+#
+#   1. NT_PRSTATUS registers (RIP/RSP) are correct for every thread.
+#   2. The memory snapshot (Child 2 COW pages) contains intact stack frames
+#      at those RSP values -- i.e. the register and memory snapshots are
+#      temporally consistent.
+#   3. GDB can resolve function names (binary load address / NT_FILE correct).
+#
+# target_callstack is compiled as PIE (modern distro default) so the test
+# exercises NT_FILE load-bias resolution exactly as real-world binaries do.
+#
+section "Core dump quality: stack frames and thread registers"
+
+# Print detailed diagnostics when the callstack test fails, isolating whether
+# the problem is registers (RIP/RSP), symbol resolution (NT_FILE load bias),
+# or stack memory (PT_LOAD coverage).
+#   $1 = core pid    $2 = the 'thread apply all bt' output already collected
+callstack_dump_diagnostics() {
+    local pid="$1" bt="$2"
+    local core="core.$pid"
+    local exe="$BIN_DIR/target_callstack"
+
+    echo "    ===== DIAGNOSTICS ====="
+
+    echo "    --- thread apply all bt (raw) ---"
+    echo "$bt" | sed 's/^/      /'
+
+    echo "    --- per-thread RIP and symbol-at-RIP (from core) ---"
+    gdb --batch -ex "set confirm off" -ex "core-file $core" \
+        -ex "thread apply all bt 1" \
+        -ex "info auxv" \
+        -ex quit "$exe" 2>&1 | grep -iE "thread|rip|0x|AT_PHDR|AT_ENTRY|AT_BASE" \
+        | head -30 | sed 's/^/      /'
+
+    echo "    --- NT_FILE / PRSTATUS notes in core ---"
+    readelf -n "$core" 2>/dev/null | grep -iE "NT_FILE|NT_PRSTATUS|CORE" \
+        | head -20 | sed 's/^/      /'
+
+    echo "    --- executable mapping in core's NT_FILE vs live /proc/pid/maps ---"
+    echo "      [core NT_FILE - first lines]"
+    readelf -n "$core" 2>/dev/null | grep -A60 "NT_FILE" \
+        | grep target_callstack | head -5 | sed 's/^/        /'
+    echo "      [live maps - executable]"
+    grep target_callstack "/proc/$pid/maps" 2>/dev/null | head -5 | sed 's/^/        /'
+
+    echo "    --- PT_LOAD count and first few segments ---"
+    readelf -lW "$core" 2>/dev/null | grep -E "LOAD" | head -6 | sed 's/^/      /'
+
+    echo "    ===== END DIAGNOSTICS ====="
+}
+
+t_callstack_frames() {
+    [[ $HAS_GDB -eq 1 ]] || { skip "callstack" "gdb absent"; return; }
+    [[ -x "$BIN_DIR/target_callstack" ]] || {
+        skip "callstack" "target_callstack not built (run 'make' in test/)"; return; }
+
+    start_target "$BIN_DIR/target_callstack" \
+        || { fail "callstack: target startup"; return; }
+    local pid="$TARGET_PID"
+
+    run_qcore "$pid" || { fail "callstack: qcore failed"; stop_target "$pid"; return; }
+
+    kill -0 "$pid" 2>/dev/null \
+        || { fail "callstack: target dead after dump"; return; }
+
+    # Load the core in GDB and collect the full backtrace for every thread.
+    local bt
+    bt=$(gdb --batch \
+         -ex "set confirm off" \
+         -ex "set print frame-arguments none" \
+         -ex "core-file core.$pid" \
+         -ex "thread apply all bt 20" \
+         -ex quit \
+         "$BIN_DIR/target_callstack" 2>&1)
+
+    [[ $VERBOSE -eq 1 ]] && echo "$bt" | sed 's/^/    /'
+
+    # ---- Thread count -------------------------------------------------------
+    # GDB prints "Thread N (..." for each thread it finds in the core.
+    local nthreads
+    nthreads=$(echo "$bt" | grep -cE '^Thread [0-9]' || true)
+    if [[ "$nthreads" -ge 4 ]]; then
+        pass "callstack: $nthreads threads visible in core"
+    else
+        fail "callstack: $nthreads threads visible (expected >= 4)" \
+             "NT_PRSTATUS notes may be missing or have wrong pr_pid values"
+        stop_target "$pid"
+        return
+    fi
+
+    # ---- Application frame presence (non-vacuous) ---------------------------
+    # Count how many tc_* frames appear at all.  If ZERO appear, the stacks
+    # are unusable: either the registers (RIP/RSP) are wrong or the stack
+    # memory in the core does not match the live process.
+    local tc_frames
+    tc_frames=$(echo "$bt" | grep -cE "in tc_[a-z0-9_]+" || true)
+    if [[ "$tc_frames" -ge 1 ]]; then
+        pass "callstack: $tc_frames application (tc_*) frames present in backtraces"
+    else
+        fail "callstack: ZERO tc_* frames in any backtrace -- stacks are garbage"
+        callstack_dump_diagnostics "$pid" "$bt"
+    fi
+
+    # ---- Per-function presence checks ---------------------------------------
+    # Each tc_* function is unique to one thread.  Its absence means either
+    # RSP was wrong (wrong frame) or the stack memory is missing/corrupted.
+    local all_present=1
+    for fn in \
+        tc_t1_entry tc_t1_mid tc_t1_leaf \
+        tc_t2_entry tc_t2_leaf \
+        tc_t3_leaf \
+        tc_main_blocker tc_main_leaf
+    do
+        if echo "$bt" | grep -qE "in ${fn}[[:space:](]"; then
+            pass "callstack: '${fn}' present in backtrace"
+        else
+            fail "callstack: '${fn}' MISSING from all backtraces" \
+                 "RSP or stack memory is inconsistent with the live state"
+            all_present=0
+        fi
+    done
+
+    # ---- Call order check for thread 1 (deepest chain) ----------------------
+    # In GDB output, callee frames have lower #N numbers and appear earlier
+    # in the text.  tc_t1_leaf (#0 equivalent) must appear before tc_t1_mid,
+    # which must appear before tc_t1_entry.
+    if [[ "$all_present" -eq 1 ]]; then
+        local l_leaf l_mid l_entry
+        l_leaf=$(echo  "$bt" | grep -nE "in tc_t1_leaf[[:space:](]"  | head -1 | cut -d: -f1)
+        l_mid=$(echo   "$bt" | grep -nE "in tc_t1_mid[[:space:](]"   | head -1 | cut -d: -f1)
+        l_entry=$(echo "$bt" | grep -nE "in tc_t1_entry[[:space:](]" | head -1 | cut -d: -f1)
+
+        if [[ -n "$l_leaf" && -n "$l_mid" && -n "$l_entry" &&
+              "$l_leaf" -lt "$l_mid" && "$l_mid" -lt "$l_entry" ]]; then
+            pass "callstack: frame order correct: tc_t1_leaf < tc_t1_mid < tc_t1_entry"
+        else
+            fail "callstack: frame order wrong for thread-1 chain" \
+                 "leaf=$l_leaf mid=$l_mid entry=$l_entry (expected leaf < mid < entry)" \
+                 "stack memory snapshot may not match the register snapshot"
+        fi
+
+        # Spot-check thread 2's chain.
+        local l2_leaf l2_entry
+        l2_leaf=$(echo  "$bt" | grep -nE "in tc_t2_leaf[[:space:](]"  | head -1 | cut -d: -f1)
+        l2_entry=$(echo "$bt" | grep -nE "in tc_t2_entry[[:space:](]" | head -1 | cut -d: -f1)
+        if [[ -n "$l2_leaf" && -n "$l2_entry" && "$l2_leaf" -lt "$l2_entry" ]]; then
+            pass "callstack: frame order correct: tc_t2_leaf < tc_t2_entry"
+        else
+            fail "callstack: frame order wrong for thread-2 chain" \
+                 "leaf=$l2_leaf entry=$l2_entry"
+        fi
+
+        # Main thread chain.
+        local lm_leaf lm_blocker
+        lm_leaf=$(echo    "$bt" | grep -nE "in tc_main_leaf[[:space:](]"    | head -1 | cut -d: -f1)
+        lm_blocker=$(echo "$bt" | grep -nE "in tc_main_blocker[[:space:](]" | head -1 | cut -d: -f1)
+        if [[ -n "$lm_leaf" && -n "$lm_blocker" && "$lm_leaf" -lt "$lm_blocker" ]]; then
+            pass "callstack: frame order correct: tc_main_leaf < tc_main_blocker"
+        else
+            fail "callstack: frame order wrong for main-thread chain" \
+                 "leaf=$lm_leaf blocker=$lm_blocker"
+        fi
+    fi
+
+    stop_target "$pid"
+}
+
 # -- Old failure: safe thread was in syscall (verify we used user-space) ----
 section "Parasite quality: injection point"
 
@@ -538,6 +710,9 @@ main() {
 
     section "Register fidelity"
     t_registers
+
+    section "Core dump quality: stack frames and thread registers"
+    t_callstack_frames
 
     section "Failure-scenario regressions"
     t_repeated_runs

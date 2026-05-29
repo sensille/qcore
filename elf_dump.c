@@ -197,6 +197,39 @@ static struct elf_prpsinfo make_prpsinfo(pid_t pid)
 }
 
 /*
+ * Build NT_AUXV note from /proc/<pid>/auxv.
+ *
+ * GDB uses the auxiliary vector (specifically AT_PHDR / AT_ENTRY / AT_BASE)
+ * to determine the load bias of a PIE executable and of ld.so.  Without
+ * NT_AUXV, GDB cannot place a position-independent executable's symbols or
+ * find its .eh_frame unwind info, so every backtrace frame shows as "?? ()"
+ * and stack unwinding produces garbage -- even though the stack memory in
+ * the core is perfectly intact.  Non-PIE binaries have fixed load addresses
+ * and do not need this, which is why the bug only surfaces with PIE targets.
+ */
+static int append_nt_auxv(uint8_t **buf, size_t *sz, size_t *cap, pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/auxv", (int)pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "open(%s): %s (PIE symbols may not resolve)\n",
+                path, strerror(errno));
+        return 0;   /* non-fatal: core is still produced, just less useful */
+    }
+
+    uint8_t auxv[4096];
+    ssize_t n = read(fd, auxv, sizeof(auxv));
+    close(fd);
+    if (n <= 0) {
+        fprintf(stderr, "read(%s): empty (PIE symbols may not resolve)\n", path);
+        return 0;
+    }
+
+    return append_note(buf, sz, cap, NT_AUXV, "CORE", auxv, (uint32_t)n);
+}
+
+/*
  * Build NT_FILE note: maps each file-backed region to its filename.
  * Format: count, page_size, then (start, end, pgoff) * count, then filenames.
  */
@@ -301,6 +334,11 @@ int dump_core(qcore_state_t *state)
     struct elf_prpsinfo pi = make_prpsinfo(state->target_pid);
     if (append_note(&notes, &notes_sz, &notes_cap,
                     NT_PRPSINFO, "CORE", &pi, sizeof(pi)) < 0)
+        return -1;
+
+    /* NT_AUXV - required for GDB to place PIE executables and resolve
+     * symbols / unwind info.  Read from child2 (COW copy of the target). */
+    if (append_nt_auxv(&notes, &notes_sz, &notes_cap, cpid) < 0)
         return -1;
 
     /* NT_FILE */
