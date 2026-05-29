@@ -38,23 +38,53 @@ static void emergency_cleanup(int sig)
     qcore_state_t *s = (qcore_state_t *)g_state;
     if (!s) _exit(1);
 
-    /* If we modified bytes at the safe thread's RIP, restore them. */
-    if (s->safe_bytes_modified && s->safe_thread_idx >= 0) {
-        pid_t tid = s->threads.data[s->safe_thread_idx].tid;
-        ptrace(PTRACE_POKETEXT, tid,
+    int sidx = s->safe_thread_idx;
+
+    /* Phase 3 guard: the parasite is running natively via PTRACE_CONT.
+     *
+     * Detectable state: mmap_addr != 0 (pages allocated) and
+     * safe_bytes_modified == 0 (no injection in progress -- the bytes at
+     * original RIP were already restored after mmap, before PTRACE_CONT).
+     *
+     * Without this guard, the injector resumes into the parasite spin-loop
+     * after detach, eventually executes int3 (or ud2 on timeout), and --
+     * because qcore is no longer the tracer -- the resulting SIGTRAP kills
+     * the target process with its default action.
+     *
+     * Fix: PTRACE_INTERRUPT the injector, wait for it to stop, then
+     * overwrite its registers with the original pre-injection values so it
+     * resumes at its original code after PTRACE_DETACH.  The 3 mmap'd pages
+     * (12KB) are left mapped -- an acceptable leak in an emergency path. */
+    if (sidx >= 0 && s->mmap_addr && !s->safe_bytes_modified) {
+        pid_t safe_tid = s->threads.data[sidx].tid;
+        ptrace(PTRACE_INTERRUPT, safe_tid, 0, 0);
+        int st;
+        waitpid(safe_tid, &st, __WALL);
+        ptrace(PTRACE_SETREGS, safe_tid, NULL,
+               (struct user_regs_struct *)&s->safe_saved_regs);
+        s->mmap_addr = 0;
+    }
+
+    /* If we modified bytes at the safe thread's RIP (mmap/munmap injection
+     * in progress), restore them and the original registers. */
+    if (s->safe_bytes_modified && sidx >= 0) {
+        pid_t safe_tid = s->threads.data[sidx].tid;
+        ptrace(PTRACE_POKETEXT, safe_tid,
                (void *)s->safe_saved_regs.rip,
                (void *)(unsigned long)s->safe_saved_word);
-        ptrace(PTRACE_SETREGS, tid, NULL,
+        ptrace(PTRACE_SETREGS, safe_tid, NULL,
                (struct user_regs_struct *)&s->safe_saved_regs);
     }
 
-    /* Detach all parent threads. */
+    /* Detach all parent threads.  PTRACE_DETACH works on both stopped and
+     * running tracees (race mode): for running threads the kernel removes
+     * the ptrace relationship and the task continues without us. */
     for (int i = 0; i < s->threads.count; i++) {
         pid_t tid = s->threads.data[i].tid;
         if (tid > 0) ptrace(PTRACE_DETACH, tid, NULL, NULL);
     }
 
-    /* Kill child2 if it exists. */
+    /* Kill child2 if it was already created. */
     if (s->child2_pid > 0) {
         kill(s->child2_pid, SIGKILL);
         waitpid(s->child2_pid, NULL, __WALL);
