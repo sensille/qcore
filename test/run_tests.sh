@@ -195,6 +195,28 @@ t_core_size() {
     stop_target "$pid"
 }
 
+t_compressed_core() {
+    command -v xz >/dev/null 2>&1 || { skip "compressed_core" "xz absent"; return; }
+    start_target "$BIN_DIR/target_simple" || { fail "compressed_core: startup"; return; }
+    local pid="$TARGET_PID"
+    CLEANUP_FILES+=("core.$pid.xz")
+    run_qcore "$pid" -c || { fail "compressed_core: qcore -c failed"; stop_target "$pid"; return; }
+    # File must exist and be a valid xz stream.
+    [[ -f "core.$pid.xz" ]] \
+        && pass "compressed_core: core.$pid.xz created" \
+        || { fail "compressed_core: no .xz file"; stop_target "$pid"; return; }
+    xz --test "core.$pid.xz" 2>/dev/null \
+        && pass "compressed_core: valid xz stream" \
+        || fail "compressed_core: corrupt xz stream"
+    # Decompressed content must be a valid ELF core.
+    local etype
+    etype=$(xz -d --stdout "core.$pid.xz" 2>/dev/null | file - 2>/dev/null)
+    echo "$etype" | grep -q "ELF 64-bit LSB core" \
+        && pass "compressed_core: decompresses to a valid ELF core" \
+        || fail "compressed_core: decompressed content is not ELF core"
+    stop_target "$pid"
+}
+
 # -- Memory content ---------------------------------------------------------
 section "Memory content"
 
@@ -864,6 +886,7 @@ main() {
     section "Target liveness & size"
     t_alive
     t_core_size
+    t_compressed_core
 
     section "Memory content"
     t_marker

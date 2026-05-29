@@ -117,6 +117,9 @@ typedef struct {
      * 1 = force (-f): inject into any thread even if mid-syscall. */
     int          force;
 
+    /* 1 = compress core output through xz (-c flag). */
+    int          compress;
+
     /* Safe thread: the thread used for parasite injection.
      * Preference: a thread that was in user-space (orig_rax == -1)
      * so restoration is completely clean with no rip-2 restart. */

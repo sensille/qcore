@@ -159,10 +159,12 @@ static pid_t translate_ns_pid(pid_t target_pid, pid_t ns_local_pid)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-f] <pid>\n"
+        "Usage: %s [-f] [-c] <pid>\n"
         "  -f   force: inject into any thread even if all are mid-syscall.\n"
         "       Default (safe) mode waits for a thread to reach a clean\n"
-        "       point and refuses rather than risk disturbing the target.\n",
+        "       point and refuses rather than risk disturbing the target.\n"
+        "  -c   compress: write core through xz (produces core.<pid>.xz).\n"
+        "       Requires xz in PATH.  Uses xz level 0 for speed.\n",
         prog);
 }
 
@@ -177,11 +179,12 @@ static void check_alive(pid_t pid, const char *label)
 
 int main(int argc, char *argv[])
 {
-    int force = 0;
+    int force = 0, compress = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "f")) != -1) {
+    while ((opt = getopt(argc, argv, "fc")) != -1) {
         switch (opt) {
-        case 'f': force = 1; break;
+        case 'f': force    = 1; break;
+        case 'c': compress = 1; break;
         default:  usage(argv[0]); return 1;
         }
     }
@@ -207,8 +210,9 @@ int main(int argc, char *argv[])
     state.child2_pid       = -1;
     state.safe_thread_idx  = -1;
     state.force            = force;
-    snprintf(state.core_path,         sizeof(state.core_path),
-             "core.%d", (int)pid);
+    state.compress         = compress;
+    snprintf(state.core_path, sizeof(state.core_path),
+             compress ? "core.%d.xz" : "core.%d", (int)pid);
     snprintf(state.fds_json_path, sizeof(state.fds_json_path),
              "core.%d.fds.json", (int)pid);
     snprintf(state.threads_json_path, sizeof(state.threads_json_path),

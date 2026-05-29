@@ -369,12 +369,50 @@ int dump_core(qcore_state_t *state)
         cur_off = align_up(cur_off, page_sz);
     }
 
-    /* --- Open output file --- */
-    int core_fd = open(state->core_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (core_fd < 0) {
-        fprintf(stderr, "open(%s): %s\n", state->core_path, strerror(errno));
-        free(seg_off); free(notes); free(maps.data);
-        return -1;
+    /* --- Open output (plain file or xz pipe) --- */
+    pid_t xz_pid = -1;
+    int core_fd;
+
+    if (!state->compress) {
+        core_fd = open(state->core_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (core_fd < 0) {
+            fprintf(stderr, "open(%s): %s\n", state->core_path, strerror(errno));
+            free(seg_off); free(notes); free(maps.data);
+            return -1;
+        }
+    } else {
+        /* Pipe: qcore → xz → core_path
+         * xz reads raw ELF on stdin and writes compressed data to the file.
+         * Level 0 (fastest) to keep pause time reasonable on large cores. */
+        int pfd[2];
+        if (pipe(pfd) < 0) {
+            perror("pipe (xz)");
+            free(seg_off); free(notes); free(maps.data);
+            return -1;
+        }
+        xz_pid = fork();
+        if (xz_pid < 0) {
+            perror("fork (xz)");
+            close(pfd[0]); close(pfd[1]);
+            free(seg_off); free(notes); free(maps.data);
+            return -1;
+        }
+        if (xz_pid == 0) {
+            /* xz child */
+            close(pfd[1]);
+            if (dup2(pfd[0], STDIN_FILENO) < 0) _exit(1);
+            close(pfd[0]);
+            int out = open(state->core_path,
+                           O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (out < 0) { perror("open (xz output)"); _exit(1); }
+            if (dup2(out, STDOUT_FILENO) < 0) _exit(1);
+            close(out);
+            execlp("xz", "xz", "-z", "-0", NULL);
+            perror("exec xz");
+            _exit(1);
+        }
+        close(pfd[0]);
+        core_fd = pfd[1];
     }
 
     /* --- Write ELF header --- */
@@ -444,37 +482,46 @@ int dump_core(qcore_state_t *state)
         goto fail;
     }
 
-    /* --- Dump each readable segment --- */
+    /* --- Dump each segment sequentially (no lseek: works on pipes too) ---
+     *
+     * Segments are laid out at page-aligned offsets.  Non-readable segments
+     * have p_filesz=0 and contribute no bytes; their seg_off equals that of
+     * the next readable segment, so no gap write is needed between them.
+     * We track the current file position ourselves and write_zeros() for any
+     * alignment gap, which keeps the logic correct for both regular files and
+     * the xz pipe. */
+    uint64_t pos = data_start;
+
     for (int i = 0; i < n_load; i++) {
         map_entry_t *m = &maps.data[i];
         uint64_t seg_sz = m->end - m->start;
 
-        if (!(m->flags & PF_R)) {
-            /* Non-readable: advance file position with pad (p_filesz == 0) */
-            if (write_zeros(core_fd, (size_t)(seg_off[i] - /* cur */ (i == 0
-                    ? data_start : seg_off[i-1] + ((maps.data[i-1].flags & PF_R)
-                    ? (maps.data[i-1].end - maps.data[i-1].start) : 0)))) < 0)
+        /* Write zeros for any gap between current position and this segment. */
+        if (seg_off[i] > pos) {
+            if (write_zeros(core_fd, (size_t)(seg_off[i] - pos)) < 0)
                 goto fail_mem;
-            continue;
+            pos = seg_off[i];
         }
 
-        /* Seek to segment file offset (handles gaps between segments) */
-        if (lseek(core_fd, (off_t)seg_off[i], SEEK_SET) == -1) {
-            perror("lseek core");
-            goto fail_mem;
-        }
+        if (!(m->flags & PF_R))
+            continue;   /* p_filesz=0: nothing to write */
 
         if (dump_segment(core_fd, mem_fd, m->start, seg_sz) < 0)
             goto fail_mem;
+        pos += seg_sz;
 
-        /* Page-align for next segment */
-        uint64_t end_off = seg_off[i] + seg_sz;
-        uint64_t pad     = align_up(end_off, page_sz) - end_off;
-        if (pad && write_zeros(core_fd, (size_t)pad) < 0) goto fail_mem;
+        /* Page-align for the next segment. */
+        uint64_t aligned = align_up(pos, page_sz);
+        if (aligned > pos) {
+            if (write_zeros(core_fd, (size_t)(aligned - pos)) < 0)
+                goto fail_mem;
+            pos = aligned;
+        }
     }
 
     close(mem_fd);
     close(core_fd);
+    if (xz_pid > 0) waitpid(xz_pid, NULL, 0);
     free(seg_off); free(notes); free(maps.data);
     printf("[phase5] core written to %s\n", state->core_path);
     return 0;
@@ -483,6 +530,7 @@ fail_mem:
     close(mem_fd);
 fail:
     close(core_fd);
+    if (xz_pid > 0) { waitpid(xz_pid, NULL, 0); unlink(state->core_path); }
     free(seg_off); free(notes); free(maps.data);
     return -1;
 }
