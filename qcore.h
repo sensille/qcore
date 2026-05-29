@@ -21,6 +21,14 @@
 #include <sys/procfs.h>
 #include <elf.h>
 #include <limits.h>
+#include <time.h>
+
+static inline double qcore_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 #define PAGE_SIZE_DEFAULT 4096UL
 #define DA_INIT_CAP 64

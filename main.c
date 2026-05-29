@@ -65,6 +65,95 @@ static void emergency_cleanup(int sig)
     _exit(1);
 }
 
+/* -- PID namespace translation ----------------------------------------- */
+
+/*
+ * The parasite runs inside the target's PID namespace and reports child2_pid
+ * as seen from that namespace.  If the target is in a container, that is a
+ * namespace-local PID and PTRACE_ATTACH from the host will fail with ESRCH.
+ *
+ * To find the host-namespace PID: compare /proc/target/ns/pid with our own;
+ * if they differ, scan /proc for a process that (a) is in the same namespace
+ * as the target and (b) has ns_local_pid as its innermost NSpid entry.
+ * The first NSpid field is always the host (root-namespace) PID.
+ */
+static pid_t translate_ns_pid(pid_t target_pid, pid_t ns_local_pid)
+{
+    char target_ns[256] = {0};
+    char self_ns[256]   = {0};
+    char path[64];
+
+    snprintf(path, sizeof(path), "/proc/%d/ns/pid", (int)target_pid);
+    if (readlink(path, target_ns, sizeof(target_ns) - 1) < 0)
+        return ns_local_pid;
+
+    if (readlink("/proc/self/ns/pid", self_ns, sizeof(self_ns) - 1) < 0)
+        return ns_local_pid;
+
+    if (strcmp(target_ns, self_ns) == 0)
+        return ns_local_pid;    /* same namespace: ns_local_pid is host PID */
+
+    /*
+     * Different namespaces.  Scan /proc for a process whose:
+     *   - PID namespace symlink matches the target's (same container)
+     *   - LAST NSpid field equals ns_local_pid (innermost namespace PID)
+     * The FIRST NSpid field is the host-namespace (root) PID we need.
+     */
+    DIR *d = opendir("/proc");
+    if (!d) return ns_local_pid;
+
+    pid_t found = -1;
+    struct dirent *ent;
+
+    while ((ent = readdir(d)) != NULL && found < 0) {
+        if (ent->d_name[0] < '1' || ent->d_name[0] > '9') continue;
+        int hpid = (int)strtol(ent->d_name, NULL, 10);
+        if (hpid <= 0) continue;
+
+        /* Must be in the same PID namespace as the target. */
+        char proc_ns[256] = {0};
+        snprintf(path, sizeof(path), "/proc/%d/ns/pid", hpid);
+        if (readlink(path, proc_ns, sizeof(proc_ns) - 1) < 0) continue;
+        if (strcmp(proc_ns, target_ns) != 0) continue;
+
+        /* Parse NSpid: last field = innermost PID, first = host PID. */
+        char status[128];
+        snprintf(status, sizeof(status), "/proc/%d/status", hpid);
+        FILE *f = fopen(status, "r");
+        if (!f) continue;
+
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "NSpid:", 6) != 0) continue;
+            char *p = line + 6;
+            long first = -1, last = -1;
+            while (*p) {
+                char *end;
+                long v = strtol(p, &end, 10);
+                if (end == p) break;
+                if (first < 0) first = v;
+                last = v;
+                p = end;
+            }
+            if (last == (long)ns_local_pid && first > 0)
+                found = (pid_t)first;
+            break;
+        }
+        fclose(f);
+    }
+    closedir(d);
+
+    if (found > 0) {
+        printf("[phase5] namespace PID %d -> host PID %d\n",
+               (int)ns_local_pid, (int)found);
+        return found;
+    }
+
+    fprintf(stderr, "[phase5] warning: could not map ns-PID %d to host PID\n",
+            (int)ns_local_pid);
+    return ns_local_pid;   /* fallback: try as-is */
+}
+
 /* -- Entry point ------------------------------------------------------ */
 
 static void usage(const char *prog)
@@ -123,27 +212,42 @@ int main(int argc, char *argv[])
     printf("  sockets: %s\n", state.sockets_json_path);
 
     /* Phase 1: Seize ------------------------------------------------ */
+    double t_seize = qcore_now_ms();
     if (seize_all_threads(&state) != 0) {
         fprintf(stderr, "Phase 1 failed\n");
         return 1;
     }
+    double t_seized = qcore_now_ms();
+    printf("[timing]  seize %d thread(s): %.2f ms  <-- target frozen here\n",
+           state.threads.count, t_seized - t_seize);
     check_alive(pid, "phase1");
 
     /* Phase 2 (FD harvest, concurrent with frozen state) ------------ */
+    double t_fds = qcore_now_ms();
     harvest_fds(&state);
+    printf("[timing]  fd harvest:         %.2f ms\n", qcore_now_ms() - t_fds);
     check_alive(pid, "phase2");
 
     /* Phases 2-4: inject parasite, run, detach ---------------------- */
+    double t_inject = qcore_now_ms();
     if (inject_parasite(&state) != 0) {
         fprintf(stderr, "Parasite injection failed - emergency detach\n");
         for (int i = 0; i < state.threads.count; i++)
             ptrace(PTRACE_DETACH, state.threads.data[i].tid, NULL, NULL);
         return 1;
     }
+    double t_resumed = qcore_now_ms();
+    printf("[timing]  inject+detach:      %.2f ms\n", t_resumed - t_inject);
+    printf("[timing]  TARGET FROZEN FOR:  %.2f ms  <-- target running again\n",
+           t_resumed - t_seized);
     check_alive(pid, "phase4");
 
     /* Phase 5: attach child2, build ELF ----------------------------- */
-    /* child2 is orphaned (reparented to init) and waiting on SIGSTOP. */
+    /* Translate the namespace-local PID the parasite reported to the
+     * host-namespace PID that PTRACE_ATTACH requires.  This is a no-op
+     * when qcore and the target are in the same PID namespace. */
+    state.child2_pid = translate_ns_pid(state.target_pid, state.child2_pid);
+
     if (ptrace(PTRACE_ATTACH, state.child2_pid, NULL, NULL) == -1) {
         perror("PTRACE_ATTACH child2");
         kill(state.child2_pid, SIGKILL);
