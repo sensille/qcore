@@ -440,12 +440,14 @@ int main(int argc, char *argv[])
     if (ptrace(PTRACE_ATTACH, state.child2_pid, NULL, NULL) == -1) {
         perror("PTRACE_ATTACH child2");
         kill(state.child2_pid, SIGKILL);
+        waitpid(state.child2_pid, NULL, __WALL);   /* prevent zombie */
         return 1;
     }
     int ws2;
     if (waitpid(state.child2_pid, &ws2, 0) == -1) {
         perror("waitpid child2");
         kill(state.child2_pid, SIGKILL);
+        waitpid(state.child2_pid, NULL, __WALL);   /* prevent zombie */
         return 1;
     }
 

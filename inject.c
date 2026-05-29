@@ -526,7 +526,7 @@ int inject_parasite(qcore_state_t *state)
     printf("[timing]  munmap + restore:   %.2f ms\n",
            qcore_now_ms() - t_restore);
 
-    /* ---- 8. Detach all threads ----------------------------------- */
+    /* ---- 8. Detach all known threads ----------------------------- */
     int detached = 0;
     for (int i = 0; i < state->threads.count; i++) {
         pid_t tid = state->threads.data[i].tid;
@@ -537,6 +537,40 @@ int inject_parasite(qcore_state_t *state)
                     (int)tid, strerror(errno));
         } else {
             detached++;
+        }
+    }
+
+    /* ---- 9. Final sweep: detach threads born during the race ----- */
+    /* During safe-mode's race, PTRACE_O_TRACECLONE auto-attaches any
+     * thread the target spawns while we're watching.  Those threads are
+     * NOT in state->threads and are not detached above.  When qcore
+     * exits, every still-ptraced thread receives SIGKILL and becomes a
+     * zombie under the target PID -- exactly the "two defunct processes"
+     * symptom.  Scan /proc/<pid>/task and detach anything we missed.  */
+    {
+        char task_dir[64];
+        snprintf(task_dir, sizeof(task_dir), "/proc/%d/task",
+                 (int)state->target_pid);
+        DIR *d = opendir(task_dir);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.') continue;
+                pid_t tid = (pid_t)strtol(ent->d_name, NULL, 10);
+                if (tid <= 0) continue;
+                /* Skip threads we already handled. */
+                int known = 0;
+                for (int i = 0; i < state->threads.count; i++)
+                    if (state->threads.data[i].tid == tid) { known = 1; break; }
+                if (known) continue;
+                /* Detach silently: if it was never ptraced this is ESRCH. */
+                if (ptrace(PTRACE_DETACH, tid, NULL, NULL) == 0) {
+                    fprintf(stderr, "[phase4] detached late-born TID=%d\n",
+                            (int)tid);
+                    detached++;
+                }
+            }
+            closedir(d);
         }
     }
 
