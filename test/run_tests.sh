@@ -546,26 +546,39 @@ t_epoll_no_eintr() {
     stop_target "$pid"
 }
 
-# -- Old failure: COW child visible in target process tree ------------------
-section "Regression: double-fork stealth (was: COW child visible to watchdogs)"
+# -- Cleanup phase leaves no zombie in the target ---------------------------
+section "Cleanup: target reaps the snapshot child (no zombie left)"
 
-t_child_invisible() {
-    start_target "$BIN_DIR/target_children" || { fail "children: startup"; return; }
+t_no_zombie_after_dump() {
+    # The child is a direct child of the target during the dump.  qcore's final
+    # cleanup phase injects wait4() into the target so the target reaps it.
+    # Afterwards the target must have no <defunct> children.
+    start_target "$BIN_DIR/target_simple" || { fail "no_zombie: startup"; return; }
     local pid="$TARGET_PID"
-    run_qcore "$pid" || { fail "children: qcore"; stop_target "$pid"; return; }
-    kill -0 "$pid" 2>/dev/null || { fail "children: target dead"; return; }
-    # Ask target to stop monitoring
-    kill -USR1 "$pid" 2>/dev/null
-    sleep 0.1
-    # Check if the target logged any unexpected children to stderr
-    local log="/proc/$pid/fd/2"
-    local unexpected
-    unexpected=$(cat "$log" 2>/dev/null | grep "unexpected_child" | wc -l || echo 0)
-    if [[ "$unexpected" -eq 0 ]]; then
-        pass "children: no unexpected child PIDs seen by target"
+    run_qcore "$pid" || { fail "no_zombie: qcore"; stop_target "$pid"; return; }
+    kill -0 "$pid" 2>/dev/null || { fail "no_zombie: target dead"; return; }
+
+    # Give the kernel a moment to settle the reap.
+    sleep 0.2
+
+    # Count zombie children of the target by scanning /proc for processes
+    # whose PPid is the target and whose State is Z.
+    local zombies=0
+    local d st ppid state
+    for d in /proc/[0-9]*; do
+        st="$d/status"
+        [[ -r "$st" ]] || continue
+        ppid=$(grep -m1 '^PPid:' "$st" 2>/dev/null | awk '{print $2}')
+        [[ "$ppid" == "$pid" ]] || continue
+        state=$(grep -m1 '^State:' "$st" 2>/dev/null | awk '{print $2}')
+        [[ "$state" == "Z" ]] && zombies=$((zombies + 1))
+    done
+
+    if [[ "$zombies" -eq 0 ]]; then
+        pass "no_zombie: target has no zombie children after dump"
     else
-        fail "children: target saw $unexpected unexpected children" \
-             "(was: COW clone appeared in target's /proc/self/children)"
+        fail "no_zombie: target left with $zombies zombie child(ren)" \
+             "(cleanup phase 7 wait4 injection did not reap child)"
     fi
     stop_target "$pid"
 }
@@ -611,7 +624,7 @@ except (ConnectionRefusedError, OSError) as e:
 # call order, proving that:
 #
 #   1. NT_PRSTATUS registers (RIP/RSP) are correct for every thread.
-#   2. The memory snapshot (Child 2 COW pages) contains intact stack frames
+#   2. The memory snapshot (child COW pages) contains intact stack frames
 #      at those RSP values -- i.e. the register and memory snapshots are
 #      temporally consistent.
 #   3. GDB can resolve function names (binary load address / NT_FILE correct).
@@ -844,20 +857,20 @@ t_force_mode_dumps_idle() {
     stop_target "$pid"
 }
 
-t_child2_invisible_after_dump() {
-    start_target "$BIN_DIR/target_simple" || { fail "child2: startup"; return; }
+t_child_gone_after_dump() {
+    start_target "$BIN_DIR/target_simple" || { fail "child: startup"; return; }
     local pid="$TARGET_PID"
-    run_qcore "$pid" || { fail "child2: qcore"; stop_target "$pid"; return; }
-    # After Phase 6, child2 must be fully gone from /proc
-    local child2_pid; child2_pid=$(echo "$QCORE_OUT" | grep -oP 'child2 \(PID=\K[0-9]+')
-    if [[ -n "$child2_pid" ]]; then
-        if [[ -d "/proc/$child2_pid" ]]; then
-            fail "child2: PID=$child2_pid still in /proc after Phase 6"
+    run_qcore "$pid" || { fail "child: qcore"; stop_target "$pid"; return; }
+    # After Phases 6-7, the child must be fully gone from /proc
+    local child_pid; child_pid=$(echo "$QCORE_OUT" | grep -oP 'child \(PID=\K[0-9]+')
+    if [[ -n "$child_pid" ]]; then
+        if [[ -d "/proc/$child_pid" ]]; then
+            fail "child: PID=$child_pid still in /proc after dump"
         else
-            pass "child2: PID=$child2_pid gone from /proc after Phase 6"
+            pass "child: PID=$child_pid gone from /proc after dump"
         fi
     else
-        pass "child2: could not determine child2 PID (likely already reaped)"
+        pass "child: could not determine child PID (likely already reaped)"
     fi
     stop_target "$pid"
 }
@@ -923,12 +936,14 @@ main() {
     t_safe_mode_refuses_idle
     t_force_mode_dumps_idle
 
+    section "Cleanup: target reaps the snapshot child (no zombie left)"
+    t_no_zombie_after_dump
+
     section "Failure-scenario regressions"
     t_repeated_runs
     t_epoll_no_eintr
-    t_child_invisible
     t_tcp_socket_alive
-    t_child2_invisible_after_dump
+    t_child_gone_after_dump
 
     echo ""
     echo -e "${BOLD}Results: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}, ${YELLOW}$SKIP skipped${NC}"

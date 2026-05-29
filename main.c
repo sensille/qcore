@@ -16,15 +16,16 @@
  * 2  Find a safe injection thread (user-space or syscall-exit boundary).
  *    Inject mmap to allocate the parasite pages, write the shellcode.
  * 3  The parasite runs natively inside the target:
- *      clone(CLONE_VM) -> Child 1 (shares address space)
- *      Child 1: clone(0) -> Child 2 (COW snapshot), write child2_pid,
- *               close fds 0-1023, SIGSTOP, exit
- *      Parent:  spin on scratch page, int3 when child2_pid is visible
- * 4  Catch int3, read child2_pid, inject munmap, restore safe thread,
+ *      clone(0) -> child (COW snapshot of the target's address space)
+ *      child:  close fds, SIGSTOP, wait
+ *      parent: int3 -- qcore reads the child PID from %rax
+ * 4  Catch int3, read child PID, inject munmap, restore safe thread,
  *    PTRACE_DETACH all threads.  Target is now fully running again.
- * 5  PTRACE_ATTACH child2 (orphaned, SIGSTOP'd), build ELF core from
- *    /proc/child2/maps and /proc/child2/mem.
- * 6  SIGKILL child2 (fd-scrubbed => no side effects).
+ * 5  PTRACE_ATTACH the child (SIGSTOP'd), build ELF core from
+ *    /proc/child/maps and /proc/child/mem.
+ * 6  SIGKILL the child.
+ * 7  Re-attach to the target and inject wait4() so the target reaps the
+ *    dead child (only its real parent can release the zombie).
  */
 #include "qcore.h"
 
@@ -84,10 +85,10 @@ static void emergency_cleanup(int sig)
         if (tid > 0) ptrace(PTRACE_DETACH, tid, NULL, NULL);
     }
 
-    /* Kill child2 if it was already created. */
-    if (s->child2_pid > 0) {
-        kill(s->child2_pid, SIGKILL);
-        waitpid(s->child2_pid, NULL, __WALL);
+    /* Kill the child if it was already created. */
+    if (s->child_pid > 0) {
+        kill(s->child_pid, SIGKILL);
+        waitpid(s->child_pid, NULL, __WALL);
     }
 
     static const char msg[] = "qcore: interrupted - target detached\n";
@@ -98,7 +99,7 @@ static void emergency_cleanup(int sig)
 /* -- PID namespace translation ----------------------------------------- */
 
 /*
- * The parasite runs inside the target's PID namespace and reports child2_pid
+ * The parasite runs inside the target's PID namespace and reports child_pid
  * as seen from that namespace.  If the target is in a container, that is a
  * namespace-local PID and PTRACE_ATTACH from the host will fail with ESRCH.
  *
@@ -239,61 +240,40 @@ static void print_theory(void)
 "    blocked in a system call will see that call return -EINTR on resume,\n"
 "    exactly as if a signal had arrived.  Correct applications handle this.\n"
 "\n"
-"PHASE 3 - PARASITE INJECTION AND DOUBLE-FORK  [target is frozen]\n"
-"  qcore injects a mmap system call into the injector thread to allocate\n"
-"  three pages of read/write/execute memory within the target's address\n"
-"  space.  These pages hold a scratch area, a private stack for an\n"
-"  intermediate process, and the parasite shellcode.\n"
+"PHASE 3 - PARASITE INJECTION AND FORK  [target is frozen]\n"
+"  qcore injects a mmap system call into the injector thread to allocate a\n"
+"  few pages of read/write/execute memory within the target's address\n"
+"  space and writes the parasite shellcode there.  The injector is then\n"
+"  released with PTRACE_CONT to run the shellcode natively at full speed.\n"
 "\n"
-"  The shellcode is written to the code page and the injector is released\n"
-"  with PTRACE_CONT to run it natively at full CPU speed.\n"
+"  The shellcode performs a single clone():\n"
 "\n"
-"  The shellcode performs a double-fork:\n"
+"  Parent (the injector):\n"
+"    clone() returns the child's PID in a register.  The injector executes\n"
+"    an int3 instruction; qcore catches the SIGTRAP and reads the child PID.\n"
 "\n"
-"  Step A - First clone (CLONE_VM):\n"
-"    Creates Child 1, which shares the parent's address space.  Any write\n"
-"    by Child 1 is immediately visible to the parent without IPC.\n"
-"\n"
-"  Step B - Second clone (flags=0, from Child 1):\n"
-"    Creates Child 2.  Because the second clone does not share address\n"
-"    space, Child 2 receives a full copy-on-write snapshot of the target's\n"
-"    memory at this exact moment.  This snapshot is the basis of the core.\n"
-"\n"
-"  Step C - Child 2:\n"
-"    Closes all file descriptors from 0 to the process's open-file limit.\n"
-"    This ensures that when Child 2 is eventually killed, no file\n"
-"    descriptors are released, so no TCP RST/FIN packets are sent, no\n"
-"    io_uring rings are torn down, and no advisory file locks are dropped.\n"
-"    Child 2 then stops itself with SIGSTOP and waits.\n"
-"\n"
-"  Step D - Child 1:\n"
-"    Writes Child 2's PID to the shared scratch page (visible immediately\n"
-"    to the parent via CLONE_VM) and exits.\n"
-"\n"
-"  Step E - Parent (the injector):\n"
-"    Spins on the scratch page until Child 2's PID appears, then signals\n"
-"    qcore by executing an int3 instruction.  qcore catches the resulting\n"
-"    SIGTRAP and reads Child 2's PID from the %rax register.\n"
-"\n"
-"  Stealth: Child 1 exits before the parent returns from the first fork.\n"
-"  The OS therefore reparents Child 2 to init.  The target process never\n"
-"  has Child 2 as a direct child, so process-tree monitors and watchdogs\n"
-"  do not observe it.  No SIGCHLD is sent (exit_signal == 0).\n"
+"  Child:\n"
+"    A copy-on-write snapshot of the target's entire address space at this\n"
+"    instant -- the basis of the core.  The child closes all file\n"
+"    descriptors from 0 to the process's open-file limit, so that when it\n"
+"    is later killed no descriptors are released (no TCP RST/FIN packets,\n"
+"    no io_uring teardown, no advisory lock drops).  It then stops itself\n"
+"    with SIGSTOP and waits.\n"
 "\n"
 "PHASE 4 - RESUME THE TARGET  [freeze ends]\n"
-"  qcore injects a munmap system call to free the three parasite pages.\n"
-"  The injector's original registers are restored precisely; the kernel's\n"
+"  qcore injects a munmap system call to free the parasite pages.  The\n"
+"  injector's original registers are restored precisely; the kernel's\n"
 "  PTRACE_DETACH path with signal number 0 transparently restarts any\n"
 "  interrupted system call.  All threads are detached.  The target process\n"
 "  is now fully running again.  Total freeze time is typically under 5 ms.\n"
 "\n"
 "PHASE 5 - BUILD THE CORE FILE  [target is running]\n"
-"  qcore attaches to Child 2 (which is stopped on SIGSTOP) and reads its\n"
-"  memory map from /proc/child2/maps.  It streams the contents of each\n"
-"  readable mapping from /proc/child2/mem into a valid ELF64 core file.\n"
+"  qcore attaches to the child (which is stopped on SIGSTOP) and reads its\n"
+"  memory map from /proc/<child>/maps.  It streams the contents of each\n"
+"  readable mapping from /proc/<child>/mem into a valid ELF64 core file.\n"
 "\n"
-"  The ELF notes use the registers saved in Phase 1 from the *parent*,\n"
-"  not Child 2's registers.  This ensures the core reflects the state of\n"
+"  The ELF notes use the registers saved in Phase 1 from the *target*,\n"
+"  not the child's registers.  This ensures the core reflects the state of\n"
 "  every thread at the moment of the freeze, not the artificial state of\n"
 "  the snapshot process.\n"
 "\n"
@@ -315,10 +295,19 @@ static void print_theory(void)
 "  With -c the ELF stream is piped through 'xz -0' and written as\n"
 "  core.<pid>.xz without creating any intermediate temporary file.\n"
 "\n"
-"PHASE 6 - CLEANUP\n"
-"  Child 2 receives SIGKILL.  Because all its file descriptors were closed\n"
-"  in Phase 3, the kill has no observable side effects.  Child 2 is an\n"
-"  init orphan, so the target never receives SIGCHLD for it.\n"
+"PHASE 6 - KILL THE CHILD\n"
+"  The child receives SIGKILL.  Because all its file descriptors were\n"
+"  closed in Phase 3, the kill has no observable side effects.\n"
+"\n"
+"PHASE 7 - REAP THE CHILD\n"
+"  The child is a direct child of the target, so only the target -- as its\n"
+"  real parent -- can release the resulting zombie; a tracer cannot.  qcore\n"
+"  re-freezes all target threads (a second brief freeze with no I/O), injects\n"
+"  a wait4() into a clean thread, and detaches everything.  Freezing all\n"
+"  threads is required: the injection temporarily patches a syscall opcode\n"
+"  into shared executable memory, and any running thread that hits those\n"
+"  bytes would take SIGILL.  The injected wait4 uses the child's PID as seen\n"
+"  inside the target's PID namespace.\n"
     );
 }
 
@@ -375,7 +364,7 @@ int main(int argc, char *argv[])
     qcore_state_t state;
     memset(&state, 0, sizeof(state));
     state.target_pid       = pid;
-    state.child2_pid       = -1;
+    state.child_pid       = -1;
     state.safe_thread_idx  = -1;
     state.force            = force;
     state.compress         = compress;
@@ -431,23 +420,26 @@ int main(int argc, char *argv[])
            t_resumed - t_seized);
     check_alive(pid, "phase4");
 
-    /* Phase 5: attach child2, build ELF ----------------------------- */
-    /* Translate the namespace-local PID the parasite reported to the
-     * host-namespace PID that PTRACE_ATTACH requires.  This is a no-op
-     * when qcore and the target are in the same PID namespace. */
-    state.child2_pid = translate_ns_pid(state.target_pid, state.child2_pid);
+    /* Phase 5: attach the child, build ELF -------------------------- */
+    /* The parasite reported the child's PID as seen inside the target's PID
+     * namespace.  Keep that value (needed for the wait4 injected into the
+     * target during cleanup) and translate a separate copy to the host PID
+     * that qcore's own PTRACE_ATTACH / kill require.  The translation is a
+     * no-op when qcore and the target share a PID namespace. */
+    state.child_ns_pid = state.child_pid;
+    state.child_pid = translate_ns_pid(state.target_pid, state.child_pid);
 
-    if (ptrace(PTRACE_ATTACH, state.child2_pid, NULL, NULL) == -1) {
-        perror("PTRACE_ATTACH child2");
-        kill(state.child2_pid, SIGKILL);
-        waitpid(state.child2_pid, NULL, __WALL);   /* prevent zombie */
+    if (ptrace(PTRACE_ATTACH, state.child_pid, NULL, NULL) == -1) {
+        perror("PTRACE_ATTACH child");
+        kill(state.child_pid, SIGKILL);
+        waitpid(state.child_pid, NULL, __WALL);   /* prevent zombie */
         return 1;
     }
     int ws2;
-    if (waitpid(state.child2_pid, &ws2, 0) == -1) {
-        perror("waitpid child2");
-        kill(state.child2_pid, SIGKILL);
-        waitpid(state.child2_pid, NULL, __WALL);   /* prevent zombie */
+    if (waitpid(state.child_pid, &ws2, 0) == -1) {
+        perror("waitpid child");
+        kill(state.child_pid, SIGKILL);
+        waitpid(state.child_pid, NULL, __WALL);   /* prevent zombie */
         return 1;
     }
 
@@ -459,11 +451,18 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Phase 5 (core dump) failed\n");
     check_alive(pid, "phase5");
 
-    /* Phase 6: kill child2 ------------------------------------------ */
-    kill(state.child2_pid, SIGKILL);
-    waitpid(state.child2_pid, NULL, __WALL);
-    printf("[phase6] child2 (PID=%d) killed\n", (int)state.child2_pid);
+    /* Phase 6: kill the child --------------------------------------- */
+    kill(state.child_pid, SIGKILL);
+    waitpid(state.child_pid, NULL, __WALL);   /* reap qcore's tracer side */
+    printf("[phase6] child (PID=%d) killed\n", (int)state.child_pid);
     check_alive(pid, "phase6");
+
+    /* Phase 7: make the target reap the dead child ------------------ */
+    /* The child is a direct child of the target, so only the target can
+     * release the zombie.  Briefly re-attach and inject wait4(). */
+    if (state.child_ns_pid > 0)
+        reap_child_in_target(&state);
+    check_alive(pid, "phase7");
 
     free(state.threads.data);
     free(state.fds.data);

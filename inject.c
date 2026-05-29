@@ -501,24 +501,19 @@ int inject_parasite(qcore_state_t *state)
     printf("[timing]  parasite (double-fork): %.2f ms\n",
            qcore_now_ms() - t_parasite_start);
 
-    /* ---- 6. Extract child2_pid from %rax ------------------------- */
+    /* ---- 6. Extract child PID from %rax -------------------------- */
     struct user_regs_struct trap_regs;
     if (ptrace(PTRACE_GETREGS, safe_tid, NULL, &trap_regs) == -1) {
         perror("GETREGS (trap)"); goto fail;
     }
     long long raw = (long long)trap_regs.rax;
     if (raw <= 0) {
-        if (raw == -1)
-            fprintf(stderr, "[inject] parasite spin timed out "
-                    "(Child 1 never wrote child2_pid; "
-                    "likely OOM-killed or clone() failed)\n");
-        else
-            fprintf(stderr, "[inject] parasite clone() failed: errno=%lld\n",
-                    -raw);
+        fprintf(stderr, "[inject] parasite clone() failed: errno=%lld\n",
+                -raw);
         goto fail;
     }
-    state->child2_pid = (pid_t)raw;
-    printf("[phase3] parasite complete - child2 PID=%d\n", (int)state->child2_pid);
+    state->child_pid = (pid_t)raw;
+    printf("[phase3] parasite complete - child PID=%d\n", (int)state->child_pid);
 
     /* ---- 7. Free parasite mapping + restore safe thread ---------- */
     double t_restore = qcore_now_ms();
@@ -582,4 +577,90 @@ fail:
      * so the target survives.  The caller (main.c) detaches all threads. */
     restore_safe_thread(state, safe_tid, rip);
     return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cleanup phase: make the target reap the dead child                  */
+
+/*
+ * The child is a direct child of the target.  After qcore kills it, it
+ * becomes a zombie that only its parent -- the target -- can release.  qcore
+ * is at most its tracer, which is not enough.  So we briefly re-attach to one
+ * thread of the target and inject a wait4() on the child, causing the target
+ * to reap its own zombie child.
+ *
+ * The injected wait4 runs inside the target's PID namespace, so it must use
+ * the namespace-local PID (child_ns_pid), not the host PID.  __WALL is
+ * required because the child was cloned with exit_signal=0.
+ *
+ * This is a second, very brief freeze (a single injected syscall on one
+ * thread).  Any thread works: we restore its exact registers and detach, so
+ * an interrupted syscall restarts transparently.
+ */
+int reap_child_in_target(qcore_state_t *state)
+{
+    /*
+     * Re-seize ALL threads before injecting.
+     *
+     * The wait4 injection works by temporarily patching a syscall opcode
+     * (0x0F 0x05) into the target's executable memory at the injected
+     * thread's RIP -- which lives in shared library/binary code.  If any
+     * OTHER thread were running, it could execute those patched bytes (or a
+     * now-misaligned instruction) and take SIGILL.  Freezing every thread
+     * for the duration of the injection closes that window, exactly as the
+     * main parasite injection does.  (Freezing only one thread while the
+     * others run is what crashes the target with SIGILL.)
+     *
+     * This is a second, brief freeze; no core I/O happens during it.
+     */
+    free(state->threads.data);
+    memset(&state->threads, 0, sizeof(state->threads));
+    if (seize_all_threads(state) != 0) {
+        fprintf(stderr, "[phase7] re-seize failed; child may remain a zombie\n");
+        return -1;
+    }
+
+    /* Prefer a user-space thread (cleanest restore); else any valid one. */
+    int idx = find_userspace_injector(state);
+    if (idx < 0)
+        for (int i = 0; i < state->threads.count; i++)
+            if (state->threads.data[i].regs_valid) { idx = i; break; }
+    if (idx < 0) {
+        fprintf(stderr, "[phase7] no thread to inject wait4 into\n");
+        for (int i = 0; i < state->threads.count; i++)
+            if (state->threads.data[i].tid > 0)
+                ptrace(PTRACE_DETACH, state->threads.data[i].tid, NULL, NULL);
+        return -1;
+    }
+
+    pid_t tid = state->threads.data[idx].tid;
+    struct user_regs_struct saved = state->threads.data[idx].regs;
+
+    /* Inject wait4(child_ns_pid, NULL, __WALL, NULL). */
+    struct user_regs_struct r = saved;
+    r.rax = 61;                          /* SYS_wait4              */
+    r.rdi = (unsigned long long)state->child_ns_pid;
+    r.rsi = 0;                           /* wstatus = NULL         */
+    r.rdx = 0x40000000;                  /* __WALL                 */
+    r.r10 = 0;                           /* rusage = NULL          */
+    long ret = exec_syscall_at(tid, saved.rip, &r);
+
+    if (ret == (long)state->child_ns_pid)
+        printf("[phase7] target reaped child (ns pid %d)\n",
+               (int)state->child_ns_pid);
+    else
+        fprintf(stderr, "[phase7] wait4 in target returned %ld "
+                "(child may already be reaped)\n", ret);
+
+    /* Restore the injected thread's exact registers. */
+    ptrace(PTRACE_SETREGS, tid, NULL, &saved);
+
+    /* Detach all threads.  The injected thread is back to its saved state;
+     * any thread interrupted in an ERESTART* syscall restarts transparently
+     * on detach (signr==0 path). */
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t t = state->threads.data[i].tid;
+        if (t > 0) ptrace(PTRACE_DETACH, t, NULL, NULL);
+    }
+    return 0;
 }

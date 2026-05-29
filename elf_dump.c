@@ -309,7 +309,7 @@ static int dump_segment(int core_fd, int mem_fd,
 
 int dump_core(qcore_state_t *state)
 {
-    pid_t cpid = state->child2_pid;
+    pid_t cpid = state->child_pid;
 
     /* --- Parse /proc/child/maps --- */
     map_list_t maps = {0};
@@ -337,7 +337,7 @@ int dump_core(qcore_state_t *state)
         return -1;
 
     /* NT_AUXV - required for GDB to place PIE executables and resolve
-     * symbols / unwind info.  Read from child2 (COW copy of the target). */
+     * symbols / unwind info.  Read from the child (COW copy of the target). */
     if (append_nt_auxv(&notes, &notes_sz, &notes_cap, cpid) < 0)
         return -1;
 

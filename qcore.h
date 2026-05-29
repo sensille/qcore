@@ -128,11 +128,15 @@ typedef struct {
     struct user_regs_struct safe_saved_regs;     /* original registers      */
     int                     safe_bytes_modified; /* 1 after PTRACE_POKETEXT */
 
-    /* Parasite allocation (3 pages: scratch + child1 stack + code). */
-    uint64_t mmap_addr;    /* base address; 0 until allocated              */
+    /* Parasite allocation (code page + spare); 0 until allocated. */
+    uint64_t mmap_addr;
 
-    /* Child 2: the orphaned grandchild holding the COW snapshot. */
-    pid_t    child2_pid;
+    /* The COW snapshot child: a direct child of the target.
+     * child_pid     = host-namespace PID (for qcore's PTRACE_ATTACH/kill).
+     * child_ns_pid  = PID as seen inside the target's namespace (for the
+     *                 wait4 injected into the target during cleanup). */
+    pid_t    child_pid;
+    pid_t    child_ns_pid;
 
     char core_path[256];
     char fds_json_path[256];
@@ -146,4 +150,5 @@ void write_threads_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  harvest_fds(qcore_state_t *state);                 /* fd_harvest.c */
 void write_fds_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  inject_parasite(qcore_state_t *state);             /* inject.c     */
+int  reap_child_in_target(qcore_state_t *state);        /* inject.c     */
 int  dump_core(qcore_state_t *state);                   /* elf_dump.c   */
