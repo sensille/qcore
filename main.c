@@ -80,10 +80,7 @@ static void emergency_cleanup(int sig)
     /* Detach all parent threads.  PTRACE_DETACH works on both stopped and
      * running tracees (race mode): for running threads the kernel removes
      * the ptrace relationship and the task continues without us. */
-    for (int i = 0; i < s->threads.count; i++) {
-        pid_t tid = s->threads.data[i].tid;
-        if (tid > 0) ptrace(PTRACE_DETACH, tid, NULL, NULL);
-    }
+    detach_all_threads(s);
 
     /* Kill the child if it was already created. */
     if (s->child_pid > 0) {
@@ -416,8 +413,7 @@ int main(int argc, char *argv[])
     double t_inject = qcore_now_ms();
     if (inject_parasite(&state) != 0) {
         fprintf(stderr, "Parasite injection failed - emergency detach\n");
-        for (int i = 0; i < state.threads.count; i++)
-            ptrace(PTRACE_DETACH, state.threads.data[i].tid, NULL, NULL);
+        detach_all_threads(&state);
         return 1;
     }
     double t_resumed = qcore_now_ms();

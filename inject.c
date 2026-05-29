@@ -170,6 +170,37 @@ static int find_any_injector(const qcore_state_t *state)
     return -1;
 }
 
+/* Detach all threads in state->threads. */
+void detach_all_threads(const qcore_state_t *state)
+{
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t t = state->threads.data[i].tid;
+        if (t > 0) ptrace(PTRACE_DETACH, t, NULL, NULL);
+    }
+}
+
+/* Inject SYS_wait4(ns_pid, NULL, __WALL, NULL) into tid at saved->rip,
+ * then restore the thread's original registers.  All other threads must
+ * be frozen before calling this to prevent SIGILL on the patched opcode. */
+static void do_inject_wait4(pid_t tid,
+                             const struct user_regs_struct *saved,
+                             pid_t ns_pid)
+{
+    struct user_regs_struct r = *saved;
+    r.rax = 61;                          /* SYS_wait4              */
+    r.rdi = (unsigned long long)ns_pid;
+    r.rsi = 0;                           /* wstatus = NULL         */
+    r.rdx = 0x40000000;                  /* __WALL                 */
+    r.r10 = 0;                           /* rusage = NULL          */
+    long ret = exec_syscall_at(tid, saved->rip, &r);
+    if (ret == (long)ns_pid)
+        printf("[phase7] target reaped child (ns pid %d)\n", (int)ns_pid);
+    else
+        fprintf(stderr, "[phase7] wait4 in target returned %ld "
+                "(child may already be reaped)\n", ret);
+    ptrace(PTRACE_SETREGS, tid, NULL, saved);
+}
+
 /* ------------------------------------------------------------------ */
 /* Race to the syscall-exit                                            */
 
@@ -599,20 +630,9 @@ fail:
  */
 int reap_child_in_target(qcore_state_t *state)
 {
-    /*
-     * Re-seize ALL threads before injecting.
-     *
-     * The wait4 injection works by temporarily patching a syscall opcode
-     * (0x0F 0x05) into the target's executable memory at the injected
-     * thread's RIP -- which lives in shared library/binary code.  If any
-     * OTHER thread were running, it could execute those patched bytes (or a
-     * now-misaligned instruction) and take SIGILL.  Freezing every thread
-     * for the duration of the injection closes that window, exactly as the
-     * main parasite injection does.  (Freezing only one thread while the
-     * others run is what crashes the target with SIGILL.)
-     *
-     * This is a second, brief freeze; no core I/O happens during it.
-     */
+    /* Re-seize ALL threads before injecting: exec_syscall_at patches a
+     * syscall opcode into shared executable memory, and any running thread
+     * that hits the patched bytes takes SIGILL. */
     free(state->threads.data);
     memset(&state->threads, 0, sizeof(state->threads));
     if (seize_all_threads(state) != 0) {
@@ -620,48 +640,18 @@ int reap_child_in_target(qcore_state_t *state)
         return -1;
     }
 
-    /* Prefer a user-space thread (cleanest restore); else any valid one. */
     int idx = find_userspace_injector(state);
-    if (idx < 0)
-        for (int i = 0; i < state->threads.count; i++)
-            if (state->threads.data[i].regs_valid) { idx = i; break; }
+    if (idx < 0) idx = find_any_injector(state);
     if (idx < 0) {
         fprintf(stderr, "[phase7] no thread to inject wait4 into\n");
-        for (int i = 0; i < state->threads.count; i++)
-            if (state->threads.data[i].tid > 0)
-                ptrace(PTRACE_DETACH, state->threads.data[i].tid, NULL, NULL);
+        detach_all_threads(state);
         return -1;
     }
 
-    pid_t tid = state->threads.data[idx].tid;
-    struct user_regs_struct saved = state->threads.data[idx].regs;
-
-    /* Inject wait4(child_ns_pid, NULL, __WALL, NULL). */
-    struct user_regs_struct r = saved;
-    r.rax = 61;                          /* SYS_wait4              */
-    r.rdi = (unsigned long long)state->child_ns_pid;
-    r.rsi = 0;                           /* wstatus = NULL         */
-    r.rdx = 0x40000000;                  /* __WALL                 */
-    r.r10 = 0;                           /* rusage = NULL          */
-    long ret = exec_syscall_at(tid, saved.rip, &r);
-
-    if (ret == (long)state->child_ns_pid)
-        printf("[phase7] target reaped child (ns pid %d)\n",
-               (int)state->child_ns_pid);
-    else
-        fprintf(stderr, "[phase7] wait4 in target returned %ld "
-                "(child may already be reaped)\n", ret);
-
-    /* Restore the injected thread's exact registers. */
-    ptrace(PTRACE_SETREGS, tid, NULL, &saved);
-
-    /* Detach all threads.  The injected thread is back to its saved state;
-     * any thread interrupted in an ERESTART* syscall restarts transparently
-     * on detach (signr==0 path). */
-    for (int i = 0; i < state->threads.count; i++) {
-        pid_t t = state->threads.data[i].tid;
-        if (t > 0) ptrace(PTRACE_DETACH, t, NULL, NULL);
-    }
+    do_inject_wait4(state->threads.data[idx].tid,
+                    &state->threads.data[idx].regs,
+                    state->child_ns_pid);
+    detach_all_threads(state);
     return 0;
 }
 
@@ -688,35 +678,21 @@ void reap_child_emergency(qcore_state_t *state)
     pid_t injector = -1;
     struct user_regs_struct cur;
 
+    /* Re-seize all known threads using the existing array (no malloc).
+     * PTRACE_SEIZE on an already-seized thread returns EPERM -- harmless. */
     for (int i = 0; i < state->threads.count; i++) {
         pid_t t = state->threads.data[i].tid;
         if (t <= 0) continue;
-        /* PTRACE_SEIZE on an already-seized thread returns EPERM; if Phase 7
-         * was interrupted mid-seize some threads may already be stopped. */
-        int seize_ok = (ptrace(PTRACE_SEIZE, t, 0, 0) == 0);
-        if (seize_ok)
+        if (ptrace(PTRACE_SEIZE, t, 0, 0) == 0)
             ptrace(PTRACE_INTERRUPT, t, 0, 0);
         int st;
-        waitpid(t, &st, __WALL);   /* consume stop event either way */
-
+        waitpid(t, &st, __WALL);
         if (injector < 0 && ptrace(PTRACE_GETREGS, t, NULL, &cur) == 0)
             injector = t;
     }
 
-    if (injector > 0) {
-        struct user_regs_struct saved = cur;
-        struct user_regs_struct r = saved;
-        r.rax = 61;                          /* SYS_wait4              */
-        r.rdi = (unsigned long long)state->child_ns_pid;
-        r.rsi = 0;
-        r.rdx = 0x40000000;                  /* __WALL                 */
-        r.r10 = 0;
-        exec_syscall_at(injector, saved.rip, &r);
-        ptrace(PTRACE_SETREGS, injector, NULL, &saved);
-    }
+    if (injector > 0)
+        do_inject_wait4(injector, &cur, state->child_ns_pid);
 
-    for (int i = 0; i < state->threads.count; i++) {
-        pid_t t = state->threads.data[i].tid;
-        if (t > 0) ptrace(PTRACE_DETACH, t, NULL, NULL);
-    }
+    detach_all_threads(state);
 }

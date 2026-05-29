@@ -152,6 +152,7 @@ void write_fds_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  inject_parasite(qcore_state_t *state);             /* inject.c     */
 int  reap_child_in_target(qcore_state_t *state);        /* inject.c     */
 void reap_child_emergency(qcore_state_t *state);        /* inject.c     */
+void detach_all_threads(const qcore_state_t *state);    /* inject.c     */
 long exec_syscall_at(pid_t tid, uint64_t rip,           /* inject.c     */
                      struct user_regs_struct *mod_regs);
 int  dump_core(qcore_state_t *state);                   /* elf_dump.c   */
