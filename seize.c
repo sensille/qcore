@@ -118,6 +118,24 @@ int seize_all_threads(qcore_state_t *state)
             fprintf(stderr, "PTRACE_GETREGS(%d): %s\n",
                     (int)t->tid, strerror(errno));
         }
+
+        /* Read the thread's name from /proc/<pid>/task/<tid>/comm.
+         * The kernel truncates it to 15 chars + newline. */
+        {
+            char comm_path[64];
+            snprintf(comm_path, sizeof(comm_path),
+                     "/proc/%d/task/%d/comm",
+                     (int)state->target_pid, (int)t->tid);
+            FILE *cf = fopen(comm_path, "r");
+            if (cf) {
+                char *_r __attribute__((unused)) =
+                    fgets(t->name, sizeof(t->name), cf);
+                fclose(cf);
+                /* Strip trailing newline */
+                char *nl = strchr(t->name, '\n');
+                if (nl) *nl = '\0';
+            }
+        }
         valid++;
     }
 

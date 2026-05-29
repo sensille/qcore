@@ -70,7 +70,7 @@ QCORE_OUT=""
 run_qcore() {
     local pid="$1"
     local out; out=$(mktemp /tmp/qcore_out_XXXXXX)
-    CLEANUP_FILES+=("$out" "core.$pid" "core.$pid.sockets.json")
+    CLEANUP_FILES+=("$out" "core.$pid" "core.$pid.sockets.json" "core.$pid.threads.json")
     local invoke=("$QCORE" "$pid")
     [[ $EUID -ne 0 ]] && invoke=(sudo "${invoke[@]}")
     if "${invoke[@]}" >"$out" 2>&1; then
@@ -273,6 +273,60 @@ t_json_fds() {
 import json; d=json.load(open('core.$pid.sockets.json')); print(len(d['fds']))" 2>/dev/null || echo 0)
     [[ "$count" -ge 3 ]] && pass "json_fds: $count FDs (>= stdin/stdout/stderr)" \
                           || fail "json_fds: too few FDs" "got $count"
+    stop_target "$pid"
+}
+
+t_threads_json_file() {
+    start_target "$BIN_DIR/target_simple" || { fail "threads_json: startup"; return; }
+    local pid="$TARGET_PID"
+    run_qcore "$pid" || { fail "threads_json: qcore"; stop_target "$pid"; return; }
+    [[ -f "core.$pid.threads.json" ]] \
+        && pass "threads_json: core.$pid.threads.json created" \
+        || fail "threads_json: file not created"
+    stop_target "$pid"
+}
+
+t_threads_json_valid() {
+    command -v python3 >/dev/null 2>&1 || { skip "threads_json_valid" "python3 absent"; return; }
+    start_target "$BIN_DIR/target_simple" || { fail "threads_json_valid: startup"; return; }
+    local pid="$TARGET_PID"
+    run_qcore "$pid" || { fail "threads_json_valid: qcore"; stop_target "$pid"; return; }
+    python3 -m json.tool "core.$pid.threads.json" >/dev/null 2>&1 \
+        && pass "threads_json_valid: well-formed JSON" \
+        || fail "threads_json_valid: malformed JSON"
+    stop_target "$pid"
+}
+
+t_threads_json_content() {
+    command -v python3 >/dev/null 2>&1 || { skip "threads_json_content" "python3 absent"; return; }
+    # Use target_mt so we have multiple named threads to check.
+    start_target "$BIN_DIR/target_mt" || { fail "threads_json_content: startup"; return; }
+    local pid="$TARGET_PID"
+    local n_threads; n_threads=$(field_of "threads" "$TARGET_LINE"); n_threads="${n_threads:-8}"
+    run_qcore "$pid" || { fail "threads_json_content: qcore"; stop_target "$pid"; return; }
+    # JSON must have the right pid and at least as many entries as threads.
+    python3 - "$pid" "$n_threads" "core.$pid.threads.json" << 'PYEOF'
+import json, sys
+pid, n_threads, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+d = json.load(open(path))
+assert d["pid"] == pid,      f"pid mismatch: {d['pid']} != {pid}"
+threads = d["threads"]
+assert len(threads) >= n_threads, \
+    f"only {len(threads)} thread entries (expected >= {n_threads})"
+for t in threads:
+    assert "tid"  in t, "missing tid field"
+    assert "name" in t, "missing name field"
+    assert isinstance(t["tid"],  int), "tid must be int"
+    assert isinstance(t["name"], str), "name must be str"
+# Every entry must have a unique TID.
+tids = [t["tid"] for t in threads]
+assert len(tids) == len(set(tids)), "duplicate TIDs"
+print(f"ok: {len(threads)} threads, all fields present")
+PYEOF
+    local rc=$?
+    [[ $rc -eq 0 ]] \
+        && pass "threads_json_content: pid correct, $n_threads+ entries, all fields valid" \
+        || fail "threads_json_content: JSON content invalid (see python output above)"
     stop_target "$pid"
 }
 
@@ -702,6 +756,9 @@ main() {
     t_json_valid
     t_json_tcp
     t_json_fds
+    t_threads_json_file
+    t_threads_json_valid
+    t_threads_json_content
 
     section "GDB integration"
     t_gdb_loads

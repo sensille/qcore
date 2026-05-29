@@ -340,3 +340,29 @@ void write_sockets_json(const qcore_state_t *state)
     fclose(f);
     printf("[phase5] wrote socket info to %s\n", state->sockets_json_path);
 }
+
+void write_threads_json(const qcore_state_t *state)
+{
+    FILE *f = fopen(state->threads_json_path, "w");
+    if (!f) {
+        fprintf(stderr, "fopen(%s): %s\n",
+                state->threads_json_path, strerror(errno));
+        return;
+    }
+
+    fprintf(f, "{\n  \"pid\": %d,\n  \"threads\": [\n",
+            (int)state->target_pid);
+
+    for (int i = 0; i < state->threads.count; i++) {
+        const thread_info_t *t = &state->threads.data[i];
+        fprintf(f, "    {\"tid\": %d, \"name\": ", (int)t->tid);
+        json_str(f, t->name[0] ? t->name : "");
+        fprintf(f, "}");
+        if (i + 1 < state->threads.count) fputc(',', f);
+        fputc('\n', f);
+    }
+
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+    printf("[phase5] wrote thread names to %s\n", state->threads_json_path);
+}

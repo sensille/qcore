@@ -179,6 +179,45 @@ static int find_safe_thread(qcore_state_t *state)
 }
 
 /* ------------------------------------------------------------------ */
+/* Cleanup                                                             */
+
+/*
+ * Restore the safe thread to its original state and free the parasite
+ * mapping.  Called on the success path AND every post-injection failure
+ * path, so the target is never left with a corrupted RIP (which would
+ * resume into the parasite's ud2 and crash the target) or a leaked RWX
+ * mapping.  Best-effort: ptrace errors here are ignored because we are
+ * already on a teardown path and the caller will detach regardless.
+ */
+static void restore_safe_thread(qcore_state_t *state, pid_t safe_tid,
+                                uint64_t rip)
+{
+    /* Free the parasite pages if still mapped. */
+    if (state->mmap_addr) {
+        struct user_regs_struct unmap_regs = state->safe_saved_regs;
+        unmap_regs.rax = 11;          /* SYS_munmap */
+        unmap_regs.rdi = state->mmap_addr;
+        unmap_regs.rsi = PARASITE_MMAP_SIZE;
+        state->safe_bytes_modified = 1;
+        exec_syscall_at(safe_tid, rip, &unmap_regs);
+        state->safe_bytes_modified = 0;
+        state->mmap_addr = 0;
+    }
+
+    /* Restore original registers.  Convert an interrupted syscall's restart
+     * code (or syscall-entry state where rax == orig_rax) to -EINTR; never
+     * rip-2 (re-executing stateful syscalls is unsafe). */
+    struct user_regs_struct restore_regs = state->safe_saved_regs;
+    if (restore_regs.orig_rax != (unsigned long long)-1) {
+        if (is_restart_code((long long)restore_regs.rax) ||
+            restore_regs.rax == restore_regs.orig_rax)
+            restore_regs.rax = (unsigned long long)(-EINTR);
+    }
+    ptrace(PTRACE_SETREGS, safe_tid, NULL, &restore_regs);
+    state->safe_bytes_modified = 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Main entry point                                                    */
 
 int inject_parasite(qcore_state_t *state)
@@ -218,7 +257,7 @@ int inject_parasite(qcore_state_t *state)
     state->safe_bytes_modified = 0;
     if (mmap_ret == LONG_MIN || mmap_ret < 0) {
         fprintf(stderr, "[inject] mmap failed: %ld\n", mmap_ret);
-        return -1;
+        goto fail;
     }
     state->mmap_addr = (uint64_t)mmap_ret;
     printf("[timing]  mmap injection:    %.2f ms\n",
@@ -227,19 +266,35 @@ int inject_parasite(qcore_state_t *state)
     /* ---- 3. Write parasite shellcode ----------------------------- */
     uint64_t code_addr = state->mmap_addr + CODE_OFF;
     if ((int)parasite_bin_len > 4096) {
-        fprintf(stderr, "[inject] parasite too large\n"); return -1;
+        fprintf(stderr, "[inject] parasite too large\n"); goto fail;
     }
     if (poke_bytes(safe_tid, code_addr, parasite_bin, parasite_bin_len) < 0)
-        return -1;
+        goto fail;
 
     /* ---- 4. Run parasite ----------------------------------------- */
+    /* Read the target's RLIMIT_NOFILE soft limit so the parasite closes
+     * all fds the process may hold, not just the hardcoded first 1024.
+     * Pass it in r14.  Cap at 1M to bound the loop on RLIM_INFINITY. */
+    long fd_limit = 65536;
+    {
+        struct rlimit rl;
+        if (prlimit((pid_t)state->target_pid, RLIMIT_NOFILE, NULL, &rl) == 0 &&
+            rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 0)
+            fd_limit = (long)rl.rlim_cur;
+        if (fd_limit > 1048576)
+            fd_limit = 1048576;
+    }
+
     struct user_regs_struct run_regs = state->safe_saved_regs;
     run_regs.rip = code_addr;
-    run_regs.r15 = state->mmap_addr;
+    run_regs.r15 = state->mmap_addr;  /* scratch/stack/code base  */
+    run_regs.r14 = (unsigned long long)fd_limit;  /* fd close limit */
     run_regs.rax = 0;
 
+    printf("[phase3] fd close limit: %ld\n", fd_limit);
+
     if (ptrace(PTRACE_SETREGS, safe_tid, NULL, &run_regs) == -1) {
-        perror("SETREGS (run parasite)"); return -1;
+        perror("SETREGS (run parasite)"); goto fail;
     }
 
     double t_parasite_start = qcore_now_ms();
@@ -247,24 +302,24 @@ int inject_parasite(qcore_state_t *state)
     /* PTRACE_CONT: clears TIF_SYSCALL_TRACE so the parasite's clone()
      * calls are not intercepted and munmap SINGLESTEP below is clean. */
     if (ptrace(PTRACE_CONT, safe_tid, 0, 0) == -1) {
-        perror("PTRACE_CONT (run parasite)"); return -1;
+        perror("PTRACE_CONT (run parasite)"); goto fail;
     }
 
     /* ---- 5. Wait for int3 from parasite -------------------------- */
     int status;
     for (;;) {
         pid_t who = waitpid(safe_tid, &status, __WALL);
-        if (who == -1) { perror("waitpid (parasite)"); return -1; }
+        if (who == -1) { perror("waitpid (parasite)"); goto fail; }
         if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) break;
         if (WIFSTOPPED(status)) {
             if (ptrace(PTRACE_CONT, safe_tid, 0,
                        (void *)(long)WSTOPSIG(status)) == -1) {
-                perror("PTRACE_CONT (signal)"); return -1;
+                perror("PTRACE_CONT (signal)"); goto fail;
             }
             continue;
         }
         fprintf(stderr, "[inject] unexpected status 0x%x\n", status);
-        return -1;
+        goto fail;
     }
 
     printf("[timing]  parasite (double-fork): %.2f ms\n",
@@ -273,52 +328,29 @@ int inject_parasite(qcore_state_t *state)
     /* ---- 6. Extract child2_pid from %rax ------------------------- */
     struct user_regs_struct trap_regs;
     if (ptrace(PTRACE_GETREGS, safe_tid, NULL, &trap_regs) == -1) {
-        perror("GETREGS (trap)"); return -1;
+        perror("GETREGS (trap)"); goto fail;
     }
-    pid_t child2 = (pid_t)trap_regs.rax;
-    if (child2 <= 0) {
-        fprintf(stderr, "[inject] bad child2_pid=%d\n", (int)child2);
-        return -1;
+    long long raw = (long long)trap_regs.rax;
+    if (raw <= 0) {
+        if (raw == -1)
+            fprintf(stderr, "[inject] parasite spin timed out "
+                    "(Child 1 never wrote child2_pid; "
+                    "likely OOM-killed or clone() failed)\n");
+        else
+            fprintf(stderr, "[inject] parasite clone() failed: errno=%lld\n",
+                    -raw);
+        goto fail;
     }
-    state->child2_pid = child2;
-    printf("[phase3] parasite complete - child2 PID=%d\n", (int)child2);
+    state->child2_pid = (pid_t)raw;
+    printf("[phase3] parasite complete - child2 PID=%d\n", (int)state->child2_pid);
 
-    /* ---- 7. Inject munmap ---------------------------------------- */
-    double t_munmap_start = qcore_now_ms();
-
-    struct user_regs_struct unmap_regs = state->safe_saved_regs;
-    unmap_regs.rax = 11;
-    unmap_regs.rdi = state->mmap_addr;
-    unmap_regs.rsi = PARASITE_MMAP_SIZE;
-
-    state->safe_bytes_modified = 1;
-    long unmap_ret = exec_syscall_at(safe_tid, rip, &unmap_regs);
-    state->safe_bytes_modified = 0;
-    if (unmap_ret == LONG_MIN || unmap_ret < 0)
-        fprintf(stderr, "[inject] munmap warning: %ld\n", unmap_ret);
-
-    state->mmap_addr = 0;
-
-    /* ---- 8. Restore safe thread ---------------------------------- */
-    struct user_regs_struct restore_regs = state->safe_saved_regs;
-    if (restore_regs.orig_rax != (unsigned long long)-1) {
-        /* Thread was in a syscall.  Convert restart code or syscall-entry
-         * state (rax == orig_rax) to -EINTR.  Never use rip-2: stateful
-         * syscalls (io_uring_enter, nanosleep, partial write) must not be
-         * re-executed from scratch. */
-        if (is_restart_code((long long)restore_regs.rax) ||
-            restore_regs.rax == restore_regs.orig_rax)
-            restore_regs.rax = (unsigned long long)(-EINTR);
-    }
-    if (ptrace(PTRACE_SETREGS, safe_tid, NULL, &restore_regs) == -1) {
-        perror("SETREGS (restore)"); return -1;
-    }
-    state->safe_bytes_modified = 0;
-
+    /* ---- 7. Free parasite mapping + restore safe thread ---------- */
+    double t_restore = qcore_now_ms();
+    restore_safe_thread(state, safe_tid, rip);
     printf("[timing]  munmap + restore:   %.2f ms\n",
-           qcore_now_ms() - t_munmap_start);
+           qcore_now_ms() - t_restore);
 
-    /* ---- 9. Detach all threads ----------------------------------- */
+    /* ---- 8. Detach all threads ----------------------------------- */
     int detached = 0;
     for (int i = 0; i < state->threads.count; i++) {
         pid_t tid = state->threads.data[i].tid;
@@ -334,4 +366,10 @@ int inject_parasite(qcore_state_t *state)
 
     printf("[phase4] parent running again - detached %d thread(s)\n", detached);
     return 0;
+
+fail:
+    /* Post-injection failure: restore the safe thread and free the mapping
+     * so the target survives.  The caller (main.c) detaches all threads. */
+    restore_safe_thread(state, safe_tid, rip);
+    return -1;
 }

@@ -197,6 +197,8 @@ int main(int argc, char *argv[])
              "core.%d", (int)pid);
     snprintf(state.sockets_json_path, sizeof(state.sockets_json_path),
              "core.%d.sockets.json", (int)pid);
+    snprintf(state.threads_json_path, sizeof(state.threads_json_path),
+             "core.%d.threads.json", (int)pid);
 
     g_state = &state;
     struct sigaction sa;
@@ -210,6 +212,7 @@ int main(int argc, char *argv[])
     printf("qcore: targeting PID %d\n", (int)pid);
     printf("  core:    %s\n", state.core_path);
     printf("  sockets: %s\n", state.sockets_json_path);
+    printf("  threads: %s\n", state.threads_json_path);
 
     /* Phase 1: Seize ------------------------------------------------ */
     double t_seize = qcore_now_ms();
@@ -261,6 +264,7 @@ int main(int argc, char *argv[])
     }
 
     write_sockets_json(&state);
+    write_threads_json(&state);
 
     int dump_ok = dump_core(&state);
     if (dump_ok != 0)

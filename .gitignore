@@ -1,8 +1,18 @@
 *.o
 qcore
+
+# Generated from parasite.S by the Makefile
+parasite.bin
+parasite.h
+
+# Test target binaries (built from test/*.c)
 test/target_simple
 test/target_mt
 test/target_sockets
 test/target_registers
+test/target_epoll
+test/target_children
+test/target_callstack
+
 core.*
 *.json

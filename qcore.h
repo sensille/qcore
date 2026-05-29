@@ -21,6 +21,7 @@
 #include <sys/procfs.h>
 #include <elf.h>
 #include <limits.h>
+#include <sys/resource.h>
 #include <time.h>
 
 static inline double qcore_now_ms(void)
@@ -39,6 +40,7 @@ typedef struct {
     pid_t                   tid;
     struct user_regs_struct regs;
     int                     regs_valid;
+    char                    name[16];   /* from /proc/<pid>/task/<tid>/comm */
 } thread_info_t;
 
 typedef struct {
@@ -118,11 +120,13 @@ typedef struct {
 
     char core_path[256];
     char sockets_json_path[256];
+    char threads_json_path[256];
 } qcore_state_t;
 
 /* ---------- Phase function declarations ---------------------------- */
 
 int  seize_all_threads(qcore_state_t *state);           /* seize.c      */
+void write_threads_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  harvest_fds(qcore_state_t *state);                 /* fd_harvest.c */
 void write_sockets_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  inject_parasite(qcore_state_t *state);             /* inject.c     */
