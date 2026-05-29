@@ -89,8 +89,6 @@ Tested on Linux 5.15+ x86-64.
 
 **Child is briefly visible:** during Phase 5, the snapshot child is a direct child of the target. Process-tree monitors that audit unexpected children will observe it for the duration of the core dump (seconds).
 
-**Memory vs register snapshot time:** the thread register state (Phase 1) and the memory snapshot (Phase 3 clone) are taken a few milliseconds apart. Memory written by other threads between Phase 1 and Phase 3 will be in the core but not reflected in any thread's saved registers.
-
 **No kernel threads:** kernel threads cannot be ptrace-attached and are silently skipped.
 
 **One core at a time:** running two qcore instances against the same target simultaneously will corrupt both cores and likely crash the target.

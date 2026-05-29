@@ -321,8 +321,9 @@ int dump_core(qcore_state_t *state)
     size_t   notes_sz = 0;
     size_t   notes_cap= 0;
 
-    /* NT_PRSTATUS for every parent thread (registers from Phase 1) */
+    /* NT_PRSTATUS for every live parent thread. */
     for (int i = 0; i < state->threads.count; i++) {
+        if (state->threads.data[i].tid <= 0) continue;   /* died during race */
         struct elf_prstatus ps = make_prstatus(&state->threads.data[i],
                                                state->target_pid);
         if (append_note(&notes, &notes_sz, &notes_cap,

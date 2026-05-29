@@ -21,7 +21,7 @@ static int thread_in_set(const thread_set_t *set, pid_t tid)
     return 0;
 }
 
-static thread_info_t *add_thread(thread_set_t *set, pid_t tid)
+thread_info_t *add_thread(thread_set_t *set, pid_t tid)
 {
     if (set->count == set->capacity) {
         int nc = set->capacity ? set->capacity * 2 : DA_INIT_CAP;

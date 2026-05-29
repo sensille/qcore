@@ -145,7 +145,8 @@ typedef struct {
 
 /* ---------- Phase function declarations ---------------------------- */
 
-int  seize_all_threads(qcore_state_t *state);           /* seize.c      */
+int              seize_all_threads(qcore_state_t *state);  /* seize.c   */
+thread_info_t   *add_thread(thread_set_t *set, pid_t tid); /* seize.c   */
 void write_threads_json(const qcore_state_t *state);    /* fd_harvest.c */
 int  harvest_fds(qcore_state_t *state);                 /* fd_harvest.c */
 void write_fds_json(const qcore_state_t *state);    /* fd_harvest.c */

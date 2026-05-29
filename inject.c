@@ -220,21 +220,58 @@ static int at_syscall_exit(pid_t tid, const struct user_regs_struct *r)
 
 /* Re-freeze every thread except the winner with PTRACE_INTERRUPT, wait for
  * each to stop, and refresh all saved registers so PT_NOTE reflects the
- * frozen instant. */
+ * frozen instant.
+ *
+ * Also sweeps /proc/<pid>/task for threads born during the race: those are
+ * already ptraced by us (PTRACE_O_TRACECLONE) but not yet in state->threads.
+ * We interrupt, waitpid, read their registers, and add them to the set so
+ * they appear in NT_PRSTATUS and are included in the register refresh and
+ * Phase 4 detach. */
 static void refreeze_others(qcore_state_t *state, pid_t winner_tid)
 {
+    /* Send PTRACE_INTERRUPT to all known non-winner threads. */
     for (int i = 0; i < state->threads.count; i++) {
         pid_t tid = state->threads.data[i].tid;
         if (tid <= 0 || tid == winner_tid) continue;
         ptrace(PTRACE_INTERRUPT, tid, 0, 0);
     }
+
+    /* Pick up any threads born during the race (auto-attached via
+     * PTRACE_O_TRACECLONE, running under PTRACE_SYSCALL). */
+    {
+        char task_dir[64];
+        snprintf(task_dir, sizeof(task_dir), "/proc/%d/task",
+                 (int)state->target_pid);
+        DIR *d = opendir(task_dir);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.') continue;
+                pid_t tid = (pid_t)strtol(ent->d_name, NULL, 10);
+                if (tid <= 0 || thread_index(state, tid) >= 0) continue;
+                /* Interrupt the auto-attached thread. */
+                if (ptrace(PTRACE_INTERRUPT, tid, 0, 0) == 0) {
+                    thread_info_t *t = add_thread(&state->threads, tid);
+                    if (t) {
+                        /* Will be waited on in the loop below. */
+                        fprintf(stderr, "[phase2] captured late-born TID=%d\n",
+                                (int)tid);
+                    }
+                }
+            }
+            closedir(d);
+        }
+    }
+
+    /* Wait for every non-winner to stop and save its current registers. */
     for (int i = 0; i < state->threads.count; i++) {
         pid_t tid = state->threads.data[i].tid;
         if (tid <= 0 || tid == winner_tid) continue;
         int st;
         if (waitpid(tid, &st, __WALL) == -1) { state->threads.data[i].tid = -1; continue; }
-        if (!WIFSTOPPED(st)) { state->threads.data[i].tid = -1; continue; }
-        ptrace(PTRACE_GETREGS, tid, NULL, &state->threads.data[i].regs);
+        if (!WIFSTOPPED(st))                 { state->threads.data[i].tid = -1; continue; }
+        state->threads.data[i].regs_valid =
+            (ptrace(PTRACE_GETREGS, tid, NULL, &state->threads.data[i].regs) == 0);
     }
 }
 
@@ -439,6 +476,17 @@ int inject_parasite(qcore_state_t *state)
         }
     }
     state->safe_thread_idx = sidx;
+
+    /* Refresh registers for every thread now that all are frozen.
+     * The Phase 1 snapshot may be stale if the safe-mode race released
+     * threads while waiting for a syscall-exit.  Taking a fresh snapshot
+     * here makes registers and the imminent memory snapshot (Phase 3 clone)
+     * perfectly consistent: both reflect the same frozen instant. */
+    for (int i = 0; i < state->threads.count; i++) {
+        thread_info_t *t = &state->threads.data[i];
+        if (t->tid > 0)
+            t->regs_valid = (ptrace(PTRACE_GETREGS, t->tid, NULL, &t->regs) == 0);
+    }
 
     pid_t safe_tid = state->threads.data[sidx].tid;
     uint64_t rip   = state->threads.data[sidx].regs.rip;
