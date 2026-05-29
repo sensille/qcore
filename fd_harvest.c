@@ -114,22 +114,25 @@ static void parse_net_table(fd_list_t *fds, const char *path,
         uint16_t lport, rport;
 
         int n;
+        uint32_t tx_q = 0, rx_q = 0;
         if (type4 == FD_TYPE_SOCKET_TCP4 || type4 == FD_TYPE_SOCKET_UDP4) {
             /* IPv4: 8-char hex address */
             uint32_t la, ra;
             n = sscanf(line,
-                " %u: %8X:%4hX %8X:%4hX %2X %*X:%*X %*X:%*X %*X %u %u %lu",
-                &sl, &la, &lport, &ra, &rport, &st, &uid, &timeout, &inode);
-            if (n < 9) continue;
+                " %u: %8X:%4hX %8X:%4hX %2X %X:%X %*X:%*X %*X %u %u %lu",
+                &sl, &la, &lport, &ra, &rport, &st, &tx_q, &rx_q,
+                &uid, &timeout, &inode);
+            if (n < 11) continue;
             fmt_ipv4(la, lport, laddr, sizeof(laddr));
             fmt_ipv4(ra, rport, raddr, sizeof(raddr));
         } else {
             /* IPv6: 32-char hex address */
             char lhex[33], rhex[33];
             n = sscanf(line,
-                " %u: %32s %32s %2X %*X:%*X %*X:%*X %*X %u %u %lu",
-                &sl, lhex, rhex, &st, &uid, &timeout, &inode);
-            if (n < 7) continue;
+                " %u: %32s %32s %2X %X:%X %*X:%*X %*X %u %u %lu",
+                &sl, lhex, rhex, &st, &tx_q, &rx_q,
+                &uid, &timeout, &inode);
+            if (n < 9) continue;
             /* Addresses include port: split at ':' */
             char *lc = strrchr(lhex, ':');
             char *rc = strrchr(rhex, ':');
@@ -149,9 +152,11 @@ static void parse_net_table(fd_list_t *fds, const char *path,
             if (fi->inode != inode) continue;
             if (fi->type != FD_TYPE_SOCKET_UNKNOWN) continue;
 
-            fi->type       = type4;   /* v4 or v6 determined by which file we parsed */
+            fi->type       = type4;
             fi->local_port = lport;
             fi->remote_port= rport;
+            fi->recv_q     = rx_q;
+            fi->send_q     = tx_q;
             strncpy(fi->local_addr,  laddr, sizeof(fi->local_addr));
             strncpy(fi->remote_addr, raddr, sizeof(fi->remote_addr));
             strncpy(fi->state,       state_str, sizeof(fi->state));
@@ -235,7 +240,9 @@ int harvest_fds(qcore_state_t *state)
         fd_info_t *fi = fd_list_add(&state->fds);
         if (!fi) { closedir(d); return -1; }
 
-        fi->fd_num = fd_num;
+        fi->fd_num    = fd_num;
+        fi->file_pos  = -1;
+        fi->file_size = -1;
         strncpy(fi->symlink, target, sizeof(fi->symlink));
 
         if (strncmp(target, "socket:[", 8) == 0) {
@@ -245,6 +252,31 @@ int harvest_fds(qcore_state_t *state)
             fi->type  = FD_TYPE_SOCKET_UNKNOWN;   /* resolve below */
         } else {
             fi->type = FD_TYPE_OTHER;
+        }
+
+        /* Open flags and seek position from /proc/<pid>/fdinfo/<fd>. */
+        {
+            char info_path[128];
+            snprintf(info_path, sizeof(info_path),
+                     "/proc/%d/fdinfo/%d", (int)state->target_pid, fd_num);
+            FILE *inf = fopen(info_path, "r");
+            if (inf) {
+                char buf[128];
+                while (fgets(buf, sizeof(buf), inf)) {
+                    if (strncmp(buf, "pos:", 4) == 0)
+                        fi->file_pos = (int64_t)strtoll(buf + 4, NULL, 10);
+                    else if (strncmp(buf, "flags:", 6) == 0)
+                        fi->open_flags = (int)strtol(buf + 6, NULL, 8);
+                }
+                fclose(inf);
+            }
+        }
+
+        /* File size for regular files and pipes. */
+        if (fi->type == FD_TYPE_OTHER) {
+            struct stat st;
+            if (stat(fd_path, &st) == 0)
+                fi->file_size = (int64_t)st.st_size;
         }
     }
     closedir(d);
@@ -294,6 +326,17 @@ static void json_str(FILE *f, const char *s) {
     fputc('"', f);
 }
 
+/* Decode the open-flags integer into a compact access-mode string. */
+static const char *access_mode(int flags)
+{
+    switch (flags & 3) {
+    case 0: return "r";
+    case 1: return "w";
+    case 2: return "rw";
+    default: return "?";
+    }
+}
+
 void write_fds_json(const qcore_state_t *state)
 {
     FILE *f = fopen(state->fds_json_path, "w");
@@ -310,6 +353,15 @@ void write_fds_json(const qcore_state_t *state)
         fprintf(f, "      \"fd\": %d,\n", fi->fd_num);
         fprintf(f, "      \"type\": \"%s\"", fd_type_to_str(fi->type));
 
+        /* Open flags: always emitted when we have them. */
+        if (fi->open_flags || fi->type == FD_TYPE_OTHER) {
+            int fl = fi->open_flags;
+            fprintf(f, ",\n      \"access\": \"%s\"", access_mode(fl));
+            if (fl & 02000)    fprintf(f, ",\n      \"append\": true");
+            if (fl & 04000)    fprintf(f, ",\n      \"nonblock\": true");
+            if (fl & 02000000) fprintf(f, ",\n      \"cloexec\": true");
+        }
+
         switch (fi->type) {
         case FD_TYPE_SOCKET_TCP4:
         case FD_TYPE_SOCKET_TCP6:
@@ -318,6 +370,8 @@ void write_fds_json(const qcore_state_t *state)
             fprintf(f, ",\n      \"local\": ");  json_str(f, fi->local_addr);
             fprintf(f, ",\n      \"remote\": "); json_str(f, fi->remote_addr);
             fprintf(f, ",\n      \"state\": ");  json_str(f, fi->state);
+            fprintf(f, ",\n      \"recv_q\": %u", fi->recv_q);
+            fprintf(f, ",\n      \"send_q\": %u", fi->send_q);
             break;
         case FD_TYPE_SOCKET_UNIX:
             fprintf(f, ",\n      \"path\": ");   json_str(f, fi->unix_path);
@@ -328,6 +382,10 @@ void write_fds_json(const qcore_state_t *state)
             break;
         case FD_TYPE_OTHER:
             fprintf(f, ",\n      \"path\": ");   json_str(f, fi->symlink);
+            if (fi->file_pos  >= 0)
+                fprintf(f, ",\n      \"pos\": %lld",  (long long)fi->file_pos);
+            if (fi->file_size >= 0)
+                fprintf(f, ",\n      \"size\": %lld", (long long)fi->file_size);
             break;
         }
 

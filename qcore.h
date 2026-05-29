@@ -67,12 +67,19 @@ typedef struct {
     char     symlink[512];
     fd_type_t type;
     uint64_t  inode;
+    /* Open flags from /proc/<pid>/fdinfo/<fd> */
+    int      open_flags;          /* raw O_* value */
+    /* File fields (FD_TYPE_OTHER) */
+    int64_t  file_pos;            /* seek position; -1 if not applicable */
+    int64_t  file_size;           /* size in bytes; -1 if not applicable */
     /* Socket fields */
     char     local_addr[80];   /* big enough for [IPv6]:port */
     char     remote_addr[80];
     uint16_t local_port;
     uint16_t remote_port;
     char     state[24];
+    uint32_t recv_q;              /* TCP/UDP receive queue bytes */
+    uint32_t send_q;              /* TCP/UDP transmit queue bytes */
     char     unix_path[256];
 } fd_info_t;
 

@@ -276,6 +276,69 @@ import json; d=json.load(open('core.$pid.fds.json')); print(len(d['fds']))" 2>/d
     stop_target "$pid"
 }
 
+t_json_fds_flags() {
+    # Every FD entry must have an "access" field (r/w/rw) from fdinfo.
+    # Regular files (stdin/stdout/stderr) must also have pos and size.
+    command -v python3 >/dev/null 2>&1 || { skip "json_fds_flags" "python3 absent"; return; }
+    start_target "$BIN_DIR/target_simple" || { fail "json_fds_flags: startup"; return; }
+    local pid="$TARGET_PID"
+    run_qcore "$pid" || { fail "json_fds_flags: qcore"; stop_target "$pid"; return; }
+    python3 - "core.$pid.fds.json" << 'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+fds = d["fds"]
+# Every entry must have "access".
+missing_access = [f["fd"] for f in fds if "access" not in f]
+assert not missing_access, f"FDs missing 'access' field: {missing_access}"
+# "access" must be one of the three valid values.
+bad_access = [f for f in fds if f.get("access") not in ("r","w","rw")]
+assert not bad_access, f"invalid 'access' values: {bad_access}"
+# Regular file FDs must have pos and size.
+file_fds = [f for f in fds if f.get("type") == "file"]
+assert file_fds, "no FD_TYPE_OTHER entries found"
+for f in file_fds:
+    assert "pos"  in f, f"fd {f['fd']} ({f.get('path','?')}) missing 'pos'"
+    assert "size" in f, f"fd {f['fd']} ({f.get('path','?')}) missing 'size'"
+    assert isinstance(f["pos"],  int), "'pos' must be int"
+    assert isinstance(f["size"], int), "'size' must be int"
+    assert f["pos"]  >= 0, "'pos' must be non-negative"
+    assert f["size"] >= 0, "'size' must be non-negative"
+print(f"ok: {len(fds)} FDs, all have access; {len(file_fds)} file FDs have pos/size")
+PYEOF
+    local rc=$?
+    [[ $rc -eq 0 ]] \
+        && pass "json_fds_flags: all FDs have access; file FDs have pos/size" \
+        || fail "json_fds_flags: missing or invalid fields (see python output)"
+    stop_target "$pid"
+}
+
+t_json_tcp_queues() {
+    # TCP sockets must expose recv_q and send_q (queue depths).
+    command -v python3 >/dev/null 2>&1 || { skip "json_tcp_queues" "python3 absent"; return; }
+    start_target "$BIN_DIR/target_sockets" || { fail "json_tcp_queues: startup"; return; }
+    local pid="$TARGET_PID"
+    run_qcore "$pid" || { fail "json_tcp_queues: qcore"; stop_target "$pid"; return; }
+    python3 - "core.$pid.fds.json" << 'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+tcp_fds = [f for f in d["fds"] if f.get("type") in ("tcp4","tcp6","udp4","udp6")]
+assert tcp_fds, "no TCP/UDP FDs found"
+for f in tcp_fds:
+    assert "recv_q" in f, f"fd {f['fd']} missing recv_q"
+    assert "send_q" in f, f"fd {f['fd']} missing send_q"
+    assert isinstance(f["recv_q"], int), "recv_q must be int"
+    assert isinstance(f["send_q"], int), "send_q must be int"
+    assert f["recv_q"] >= 0, "recv_q must be non-negative"
+    assert f["send_q"] >= 0, "send_q must be non-negative"
+print(f"ok: {len(tcp_fds)} TCP/UDP FD(s) all have recv_q and send_q")
+PYEOF
+    local rc=$?
+    [[ $rc -eq 0 ]] \
+        && pass "json_tcp_queues: TCP/UDP FDs have recv_q and send_q" \
+        || fail "json_tcp_queues: missing queue depth fields (see python output)"
+    stop_target "$pid"
+}
+
 t_threads_json_file() {
     start_target "$BIN_DIR/target_simple" || { fail "threads_json: startup"; return; }
     local pid="$TARGET_PID"
@@ -759,6 +822,8 @@ main() {
     t_json_valid
     t_json_tcp
     t_json_fds
+    t_json_fds_flags
+    t_json_tcp_queues
     t_threads_json_file
     t_threads_json_valid
     t_threads_json_content
