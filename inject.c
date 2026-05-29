@@ -64,7 +64,7 @@
  * Safe when PT_SYSCALL is not set (i.e. thread is at PTRACE_EVENT_STOP or
  * at a SIGTRAP stop after PTRACE_CONT cleared TIF_SYSCALL_TRACE).
  */
-static long exec_syscall_at(pid_t tid, uint64_t rip,
+long exec_syscall_at(pid_t tid, uint64_t rip,
                              struct user_regs_struct *mod_regs)
 {
     errno = 0;
@@ -663,4 +663,60 @@ int reap_child_in_target(qcore_state_t *state)
         if (t > 0) ptrace(PTRACE_DETACH, t, NULL, NULL);
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Emergency reap: called from the async signal handler               */
+
+/*
+ * Same goal as reap_child_in_target() but safe to call from a signal
+ * handler: uses the EXISTING threads.data (no malloc/free) and only
+ * invokes async-signal-safe functions (ptrace, waitpid, kill).
+ *
+ * Re-seizes all known threads to prevent SIGILL (other threads must not
+ * run while exec_syscall_at holds a patched instruction in shared memory).
+ * Late-born threads not in threads.data are a best-effort concern; in the
+ * Ctrl-C path that is acceptable.
+ *
+ * Silently does nothing if threads.data is empty (e.g. interrupted inside
+ * reap_child_in_target which freed and re-allocated the array).
+ */
+void reap_child_emergency(qcore_state_t *state)
+{
+    if (state->child_ns_pid <= 0 || state->threads.count == 0) return;
+
+    pid_t injector = -1;
+    struct user_regs_struct cur;
+
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t t = state->threads.data[i].tid;
+        if (t <= 0) continue;
+        /* PTRACE_SEIZE on an already-seized thread returns EPERM; if Phase 7
+         * was interrupted mid-seize some threads may already be stopped. */
+        int seize_ok = (ptrace(PTRACE_SEIZE, t, 0, 0) == 0);
+        if (seize_ok)
+            ptrace(PTRACE_INTERRUPT, t, 0, 0);
+        int st;
+        waitpid(t, &st, __WALL);   /* consume stop event either way */
+
+        if (injector < 0 && ptrace(PTRACE_GETREGS, t, NULL, &cur) == 0)
+            injector = t;
+    }
+
+    if (injector > 0) {
+        struct user_regs_struct saved = cur;
+        struct user_regs_struct r = saved;
+        r.rax = 61;                          /* SYS_wait4              */
+        r.rdi = (unsigned long long)state->child_ns_pid;
+        r.rsi = 0;
+        r.rdx = 0x40000000;                  /* __WALL                 */
+        r.r10 = 0;
+        exec_syscall_at(injector, saved.rip, &r);
+        ptrace(PTRACE_SETREGS, injector, NULL, &saved);
+    }
+
+    for (int i = 0; i < state->threads.count; i++) {
+        pid_t t = state->threads.data[i].tid;
+        if (t > 0) ptrace(PTRACE_DETACH, t, NULL, NULL);
+    }
 }

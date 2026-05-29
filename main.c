@@ -88,7 +88,13 @@ static void emergency_cleanup(int sig)
     /* Kill the child if it was already created. */
     if (s->child_pid > 0) {
         kill(s->child_pid, SIGKILL);
-        waitpid(s->child_pid, NULL, __WALL);
+        waitpid(s->child_pid, NULL, __WALL);   /* release tracer side    */
+        /* The child's exit_signal=0 means the target (its real parent)
+         * is never notified and the zombie persists under it.  Inject
+         * wait4() into the target to make it reap its own zombie child.
+         * reap_child_emergency uses only async-signal-safe functions and
+         * the existing threads.data (no malloc). */
+        reap_child_emergency(s);
     }
 
     static const char msg[] = "qcore: interrupted - target detached\n";
