@@ -1,0 +1,47 @@
+Files in this directory
+=======================
+
+core:
+    The actual core dump.
+
+threads:
+    Contains information about the threads in the process. It shows
+    the name of the thread (which can not be stored in the core), as
+    well as the thread id as seen in gdb and the pid in the host
+    and the process namespaces.
+
+pre:
+    A directory with files collected from /proc before the process
+    was stopped. As stopping the process means that all kernel threads
+    are pulled out of their syscall, we can't grab the kernel stack
+    during freeze. So we collect it beforehand, accepting the risk
+    that the thread might have changed state in the meantime. It might
+    still be useful in some cases.
+
+proc:
+    Files pulled from /proc during the freeze. The main purpose is to
+    save the state of the file descriptors with the corresponding socket
+    states. Additional files the might be useful are added.
+
+netlink_*.raw:
+    Raw netlink dumps as received from the netlink socket. These
+    complement the information from /proc/pid/net, as they contain
+    more information.
+    A dumper has yet to be provided.
+
+root:
+    Only present when requested with -b.
+    Main executable and shared libraries of the process. These can be
+    useful for standalone analysis.
+    To use this with gdb, invoke gdb with
+      gdb core.xxx/exe
+        set sysroot /path/to/core.xxx/root
+        set auto-load safe-path /path/to/core.xxx/root
+        core core.xxx/core
+    Only issue the auto-load command if you trust the target
+    libthread_db.so. Absolute paths are required for libthread_db.so
+    to work.
+
+exe:
+    Only present when requested with -b.
+    Symlink to the main executable. See above.
